@@ -9,10 +9,10 @@
  *   Optional: W5500 for dual IP+MSTP mode
  * 
  * Wiring (MAX485 to ESP32):
- *   RO  → GPIO 16 (RX2)
- *   DI  → GPIO 17 (TX2)
- *   DE+RE (tied) → GPIO 4
- *   A/B → RS485 bus
+ *   RO  -> GPIO 16 (RX2)
+ *   DI  -> GPIO 17 (TX2)
+ *   DE+RE (tied) -> GPIO 4
+ *   A/B -> RS485 bus
  */
 
 #include <SPI.h>
@@ -30,7 +30,7 @@
 // --- Ethernet (for dual mode) ---
 byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
 IPAddress ip(192, 168, 1, 200);
-IPAddress bacnetTarget(192, 168, 1, 100);
+IPAddress bacnetTarget(192, 168, 1, 255);  // Subnet broadcast for BACnet discovery
 
 // Use BACnetMSTP class instead of BACnetLight
 BACnetMSTP bacnet;
@@ -44,7 +44,10 @@ void setup() {
 
     // Option A: MSTP only (no Ethernet needed)
     // Serial2.begin(MSTP_BAUD, SERIAL_8N1, RS485_RX, RS485_TX);
-    // bacnet.beginMSTP(3000, "MSTP-Device", Serial2, RS485_DE, MSTP_MAC, MSTP_BAUD);
+    // if (!bacnet.beginMSTP(3000, "MSTP-Device", Serial2, RS485_DE, MSTP_MAC, MSTP_BAUD)) {
+    //     Serial.println("ERROR: MSTP init failed!");
+    //     while (1) delay(1000);
+    // }
 
     // Option B: Dual mode - IP + MSTP
     Ethernet.init(5);
@@ -54,8 +57,11 @@ void setup() {
     Serial.println(Ethernet.localIP());
 
     Serial2.begin(MSTP_BAUD, SERIAL_8N1, RS485_RX, RS485_TX);
-    bacnet.beginDual(3000, "DualPort-Gateway", bacnetTarget, bacnetUdp,
-                     Serial2, RS485_DE, MSTP_MAC, MSTP_BAUD);
+    if (!bacnet.beginDual(3000, "DualPort-Gateway", bacnetTarget, bacnetUdp,
+                          Serial2, RS485_DE, MSTP_MAC, MSTP_BAUD)) {
+        Serial.println("ERROR: BACnet dual-port init failed!");
+        while (1) delay(1000);
+    }
 
     // Add objects (visible on both IP and MSTP)
     bacnet.addAnalogInput(0, "Zone-Temp", 22.0, BACNET_UNITS_DEGREES_CELSIUS,

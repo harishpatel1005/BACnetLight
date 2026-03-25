@@ -31,6 +31,11 @@
 #ifndef BACNET_LIGHT_H
 #define BACNET_LIGHT_H
 
+#define BACNETLIGHT_VERSION "1.0.0"
+#define BACNETLIGHT_VERSION_MAJOR 1
+#define BACNETLIGHT_VERSION_MINOR 0
+#define BACNETLIGHT_VERSION_PATCH 0
+
 #include <Arduino.h>
 #include <Udp.h>
 
@@ -431,10 +436,10 @@ public:
      *
      * @param deviceInstance  BACnet device instance number (0-4194302)
      * @param deviceName      Human-readable device name string
-     * @param serial          Hardware serial port (e.g., Serial2)
+     * @param serial          Hardware serial port (e.g., Serial2), already configured with serial.begin()
      * @param dePin           RS485 DE/RE pin (direction control)
      * @param macAddress      MSTP MAC address (0-127)
-     * @param baud            Baud rate (default 38400)
+     * @param baud            Expected MSTP baud rate; must match the rate passed to serial.begin()
      * @param maxMaster       Highest MAC address to poll (default 127)
      * @return                true if initialized
      */
@@ -443,7 +448,8 @@ public:
                    uint32_t baud = 38400, uint8_t maxMaster = 127);
 
     /**
-     * Initialize both BACnet/IP and BACnet/MSTP (dual-port router).
+     * Initialize both BACnet/IP and BACnet/MSTP.
+     * The caller must configure the serial port with serial.begin() first.
      */
     bool beginDual(uint32_t deviceInstance, const char *deviceName,
                    IPAddress targetIP,

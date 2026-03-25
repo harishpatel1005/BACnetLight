@@ -1,15 +1,16 @@
 /*
- * BACnetLight - Modbus RTU to BACnet/IP Gateway
- * 
- * Reads Modbus holding registers over RS485 and exposes them
- * as BACnet objects over Ethernet. Supports COV notifications.
- * 
- * Currently uses simulated data. To use real RS485:
- * 1. Install ModbusMaster library
- * 2. Uncomment the ModbusMaster sections
- * 3. Wire MAX485 to ESP32
- * 
- * Hardware: ESP32 + W5500 (HSPI) + MAX485 (optional)
+ * BACnetLight - Modbus RTU to BACnet/IP Gateway Template
+ *
+ * Demonstrates how to bridge Modbus holding registers to BACnet
+ * objects over Ethernet with COV support. Ships with simulated
+ * register data so you can test without RS485 hardware.
+ *
+ * To connect real Modbus RTU devices:
+ * 1. Install the ModbusMaster library (Arduino Library Manager)
+ * 2. Uncomment the ModbusMaster sections below
+ * 3. Wire a MAX485 transceiver to your ESP32
+ *
+ * Hardware: ESP32 + W5500 (HSPI) + MAX485 (optional for real Modbus)
  */
 
 #include <SPI.h>
@@ -34,7 +35,7 @@
 
 byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
 IPAddress ip(192, 168, 1, 200);
-IPAddress bacnetTarget(192, 168, 1, 100);
+IPAddress bacnetTarget(192, 168, 1, 255);  // Subnet broadcast for BACnet discovery
 
 BACnetLight bacnet;
 EthernetUDP bacnetUdp;
@@ -63,7 +64,7 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
     Serial.println("========================================");
-    Serial.println("  Modbus-to-BACnet Gateway v2.0");
+    Serial.println("  Modbus-to-BACnet Gateway v1.0");
     Serial.println("  Using BACnetLight Library");
     Serial.println("========================================");
 
@@ -88,10 +89,13 @@ void setup() {
     // modbus.postTransmission(postTransmission);
 
     // Init BACnet
-    bacnet.begin(1234, "Modbus-BACnet-GW", bacnetTarget, bacnetUdp);
-    bacnet.setDeviceInfo("DIY-ESP32", 0, "MB-BN-GW-v2", "2.0.0", "2.0.0");
+    if (!bacnet.begin(1234, "Modbus-BACnet-GW", bacnetTarget, bacnetUdp)) {
+        Serial.println("ERROR: BACnet init failed!");
+        while (1) delay(1000);
+    }
+    bacnet.setDeviceInfo("DIY-ESP32", 0, "MB-BN-GW-v1", "1.0.0", "1.0.0");
 
-    // Map Modbus registers → BACnet objects
+    // Map Modbus registers -> BACnet objects
     bacnet.addAnalogValue(0, "HR0-Static", 250.0,
                           BACNET_UNITS_NO_UNITS, false,
                           "Static register = 250");

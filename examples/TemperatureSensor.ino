@@ -20,7 +20,7 @@
 
 byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
 IPAddress ip(192, 168, 1, 200);
-IPAddress bacnetTarget(192, 168, 1, 100);
+IPAddress bacnetTarget(192, 168, 1, 255);  // Subnet broadcast for BACnet discovery
 
 BACnetLight bacnet;
 EthernetUDP bacnetUdp;
@@ -56,8 +56,11 @@ void setup() {
     Serial.print("IP: ");
     Serial.println(Ethernet.localIP());
 
-    bacnet.begin(5678, "HVAC-Controller-01", bacnetTarget, bacnetUdp);
-    bacnet.setDeviceInfo("MyCompany", 0, "HVAC-Ctrl-v2", "2.0.0", "2.0.0");
+    if (!bacnet.begin(5678, "HVAC-Controller-01", bacnetTarget, bacnetUdp)) {
+        Serial.println("ERROR: BACnet init failed!");
+        while (1) delay(1000);
+    }
+    bacnet.setDeviceInfo("MyCompany", 0, "HVAC-Ctrl-v1", "1.0.0", "1.0.0");
 
     // Analog Inputs (read-only sensors)
     bacnet.addAnalogInput(0, "Room-Temp", 22.0, BACNET_UNITS_DEGREES_CELSIUS,
@@ -83,7 +86,7 @@ void setup() {
     bacnet.addBinaryValue(0, "Alarm-Active", false, false, "High temp alarm");
 
     // Set COV increments
-    bacnet.setCOVIncrement(BACNET_OBJ_ANALOG_INPUT, 0, 0.5);  // Notify on 0.5°C change
+    bacnet.setCOVIncrement(BACNET_OBJ_ANALOG_INPUT, 0, 0.5);  // Notify on 0.5 deg C change
     bacnet.setCOVIncrement(BACNET_OBJ_ANALOG_INPUT, 1, 2.0);  // Notify on 2% change
 
     bacnet.onWrite(onBACnetWrite);

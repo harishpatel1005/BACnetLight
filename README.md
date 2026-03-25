@@ -1,13 +1,41 @@
 # BACnetLight
 
-**A lightweight BACnet/IP & BACnet/MSTP library for ESP32 and Arduino**
+**A lightweight BACnet/IP & BACnet/MSTP library for ESP32**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Arduino](https://img.shields.io/badge/Arduino-Compatible-teal.svg)](https://www.arduino.cc/)
 [![ESP32](https://img.shields.io/badge/ESP32-Supported-green.svg)](https://www.espressif.com/)
-[![Version](https://img.shields.io/badge/version-2.0.0-orange.svg)]()
+[![Version](https://img.shields.io/badge/version-1.0.0-orange.svg)](https://github.com/harishpatel1005/BACnetLight)
 
-BACnetLight turns an ESP32 into a fully functional BACnet device -- discoverable, readable, writable, and capable of pushing live updates via COV -- in under 20 lines of code. It supports both **BACnet/IP** (Ethernet/WiFi) and **BACnet/MSTP** (RS485), covering the vast majority of real-world building automation use cases.
+BACnetLight turns an ESP32 into a fully functional BACnet device -- discoverable, readable, writable, and capable of pushing live updates via COV -- with minimal code. It supports both **BACnet/IP** (Ethernet/WiFi) and **BACnet/MSTP** (RS485), covering the vast majority of real-world building automation use cases.
+
+This repository is being prepared as the **first public release** of BACnetLight.
+
+## At a Glance
+
+- Lightweight BACnet library designed specifically for ESP32
+- Supports BACnet/IP, BACnet/MSTP, and dual-port deployments
+- Includes object modeling, WriteProperty, ReadPropertyMultiple, COV, and priority arrays
+- Ships with example sketches for common device and gateway patterns
+- Example sketches have been compiled successfully for this first public release
+
+## Contents
+
+- [Why BACnetLight?](#why-bacnetlight)
+- [Quick Start](#quick-start)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [API Reference](#api-reference)
+- [Examples](#examples)
+- [Configuration](#configuration)
+- [Testing with YABE](#testing-with-yabe)
+- [Hardware Compatibility](#hardware-compatibility)
+- [Architecture](#architecture)
+- [Security Considerations](#security-considerations)
+- [Limitations](#limitations)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+- [License](#license)
 
 ## Why BACnetLight?
 
@@ -57,6 +85,22 @@ void loop() {
 }
 ```
 
+If you want a complete sketch with serial logging and startup flow, start with [`examples/BasicDevice.ino`](examples/BasicDevice.ino).
+
+## Requirements
+
+### Software
+
+- Arduino IDE 2.x or another Arduino-compatible build environment
+- ESP32 board support package
+- Arduino `Ethernet` library for BACnet/IP over Ethernet
+- A UDP transport such as `EthernetUDP` or `WiFiUDP`
+
+### Hardware
+
+- **BACnet/IP:** ESP32 plus Ethernet hardware such as W5500, or ESP32 WiFi when using `WiFiUDP`
+- **BACnet/MSTP:** ESP32 plus an RS485 transceiver such as MAX485 or MAX3485
+
 ## Features
 
 ### BACnet Services
@@ -88,15 +132,18 @@ void loop() {
 
 ## Installation
 
-### Arduino Library Manager
-1. **Sketch -> Include Library -> Manage Libraries**
-2. Search **"BACnetLight"**
-3. Click **Install**
-
 ### Manual
 1. Download/clone this repository
 2. Copy `BACnetLight/` to `Documents/Arduino/libraries/`
 3. Restart Arduino IDE
+
+### Arduino Library Manager
+
+Use Library Manager after BACnetLight has been accepted there:
+
+1. **Sketch -> Include Library -> Manage Libraries**
+2. Search **"BACnetLight"**
+3. Click **Install**
 
 ## API Reference
 
@@ -116,14 +163,24 @@ bacnet.begin(1234, "Device-Name", IPAddress(192,168,1,255), ethUdp);
 
 // Start BACnet/MSTP only (no IP stack needed)
 Serial2.begin(38400, SERIAL_8N1, RX_PIN, TX_PIN);
+// beginMSTP() expects the serial port to already be configured
 bacnet.beginMSTP(1234, "Device-Name", Serial2, dePin, macAddress, 38400, 127);
 
 // Start both simultaneously (dual-port)
+Serial2.begin(38400, SERIAL_8N1, RX_PIN, TX_PIN);
 bacnet.beginDual(1234, "Dual-Device", targetIP, ethUdp, Serial2, dePin, macAddr, 38400);
 
 // Set device metadata
 bacnet.setDeviceInfo("Vendor", 0, "Model", "1.0.0", "1.0.0");
 ```
+
+### Typical Setup Flow
+
+1. Configure your network transport or serial port.
+2. Start BACnet with `begin()`, `beginMSTP()`, or `beginDual()`.
+3. Add one or more BACnet objects.
+4. Call `loop()` continuously from the Arduino main loop.
+5. Update values with `setValue()` or react to external writes with `onWrite()`.
 
 ### Creating Objects
 
@@ -150,7 +207,13 @@ bacnet.setValue(BACNET_OBJ_ANALOG_INPUT, 0, 23.5);
 // Read current value
 float temp = bacnet.getValue(BACNET_OBJ_ANALOG_INPUT, 0);
 
-// Command with priority (for AO/BO)
+// Get direct object pointer
+BACnetObject *obj = bacnet.getObject(BACNET_OBJ_ANALOG_INPUT, 0);
+
+// Get total object count
+uint8_t count = bacnet.getObjectCount();
+
+// Command with priority (for AO/BO, priorities 1-16 where 1 is highest)
 bacnet.commandObject(BACNET_OBJ_ANALOG_OUTPUT, 0, 75.0, 8);  // Priority 8
 bacnet.relinquish(BACNET_OBJ_ANALOG_OUTPUT, 0, 8);            // Release priority 8
 ```
@@ -211,7 +274,15 @@ BACNET_UNITS_NO_UNITS              // 95
 | **TemperatureSensor** | HVAC controller with AI, AO, AV, BI, BO, BV + write validation |
 | **COVExample** | COV subscriptions with different increments per object |
 | **MSTProtocol** | BACnet/MSTP over RS485, dual-port IP+MSTP |
-| **ModbusBACnetGateway** | Full Modbus RTU -> BACnet/IP gateway with COV |
+| **ModbusBACnetGateway** | Modbus RTU -> BACnet/IP gateway template (simulated data, ready for real RS485) |
+
+Recommended order for first-time users:
+
+1. `BasicDevice`
+2. `TemperatureSensor`
+3. `COVExample`
+4. `MSTProtocol`
+5. `ModbusBACnetGateway`
 
 ## Configuration
 
@@ -227,6 +298,11 @@ Override these before `#include <BACnetLight.h>`:
 #define BACNET_COV_MAX_RETRIES       2     // Subscription cancelled after this many timeouts
 ```
 
+## Notes
+
+- BACnet object identifiers must be unique per device. Adding the same object type/instance twice now fails and returns `nullptr`.
+- For BACnet/MSTP, call `Serial.begin(...)` on the chosen hardware port before `beginMSTP()` or `beginDual()`. The `baud` argument must match that serial configuration.
+
 ## Testing with YABE
 
 1. Install [YABE](https://sourceforge.net/projects/yetanotherbacnetexplorer/)
@@ -241,7 +317,7 @@ Override these before `#include <BACnetLight.h>`:
 
 **Tested:** ESP32 + W5500 (SPI Ethernet), ESP32 + MAX485 (RS485)
 
-**Should work:** ESP32 + ENC28J60, ESP32 WiFi (WiFiUDP), ESP8266 + W5500
+**Should work:** ESP32 + ENC28J60, ESP32 WiFi (WiFiUDP)
 
 ## Architecture
 
@@ -263,14 +339,33 @@ BACnetMSTP (extends BACnetLight - adds RS485)
 \-- Poll-for-master discovery
 ```
 
+## Repository Layout
+
+- `BACnetLight.h` - public API, constants, object structures, and class declarations
+- `BACnetLight.cpp` - BACnet/IP implementation, object handling, service handlers, and COV logic
+- `BACnetMSTP.cpp` - BACnet/MSTP transport and RS485 state machine
+- `examples/` - ready-to-build example sketches
+- `library.properties` - Arduino library metadata
+- `keywords.txt` - Arduino IDE syntax highlighting hints
+
+## Security Considerations
+
+BACnet/IP transmits plain-text UDP with no authentication or encryption. BACnet/MSTP uses unencrypted RS485. This is standard for the BACnet protocol, but you should:
+
+- Deploy BACnet devices on an isolated building automation network (VLAN)
+- Do not expose BACnet UDP port (47808) to the internet
+- Use firewalls to restrict which hosts can reach the device
+
 ## Limitations
 
-- No segmentation (responses limited to ~480 bytes)
+- No segmentation (responses limited to ~480 bytes; Segmentation_Supported reports `no-segmentation`)
 - No alarm/event reporting
 - No scheduling objects
 - No trend logging
 - No BACnet Secure Connect (BACnet/SC)
+- No routing (routed NPDU messages with DNET/SNET are parsed but not forwarded)
 - MSTP: simplified token-passing (functional but not BTL-certified)
+- Object/device names are truncated to 31 characters (`BACNET_MAX_NAME_LEN - 1`), descriptions to 63 characters (`BACNET_MAX_DESC_LEN - 1`)
 
 ## Roadmap
 
@@ -281,7 +376,12 @@ BACnetMSTP (extends BACnetLight - adds RS485)
 
 ## Contributing
 
-Contributions welcome! Please open an issue first to discuss changes.
+Contributions are welcome.
+
+- Use issues for bugs, feature requests, and API discussions
+- Keep examples focused and easy to compile
+- Update README snippets when public API or setup behavior changes
+- Prefer small pull requests with one clear purpose
 
 ## License
 

@@ -83,7 +83,10 @@ bool BACnetMSTP::beginMSTP(uint32_t deviceInstance, const char *deviceName,
     pinMode(_dePin, OUTPUT);
     setTxMode(false); // Start in receive mode
 
-    _mstpSerial->begin(baud, SERIAL_8N1);
+    // The caller is responsible for calling serial.begin() with the
+    // correct baud rate and pin mapping *before* calling beginMSTP().
+    // Re-initialising the port here would reset ESP32 RX/TX pins to
+    // their defaults, breaking any custom pin assignment.
 
     _mstpEnabled = true;
     _mstpState = MSTP_NO_TOKEN;
@@ -252,7 +255,7 @@ void BACnetMSTP::mstpReceive() {
                                  | ((uint16_t)_mstpRxBuf[8 + dataLen + 1] << 8);
                 _mstpRxLen = 0;
                 if (calcCrc != rxCrc) {
-                    continue; // Corrupted payload — discard silently
+                    continue; // Corrupted payload -- discard silently
                 }
 
                 uint8_t frameType = _mstpRxBuf[2];
@@ -323,10 +326,27 @@ void BACnetMSTP::mstpHandleDataFrame(uint8_t src, uint8_t *data, int dataLen, bo
     uint8_t npduControl = data[1];
     int pos = 2;
 
-    // Skip DNET/SNET if present
-    if (npduControl & 0x20) { pos += 2; uint8_t dl = data[pos++]; pos += dl; }
-    if (npduControl & 0x08) { pos += 2; uint8_t sl = data[pos++]; pos += sl; }
-    if (npduControl & 0x10) pos++; // hop count (bit 4)
+    // Skip DNET/DADR if present (bit 5)
+    if (npduControl & 0x20) {
+        if (pos + 3 > dataLen) return;
+        pos += 2;
+        uint8_t dl = data[pos++];
+        if (pos + dl > dataLen) return;
+        pos += dl;
+    }
+    // Skip SNET/SADR if present (bit 3)
+    if (npduControl & 0x08) {
+        if (pos + 3 > dataLen) return;
+        pos += 2;
+        uint8_t sl = data[pos++];
+        if (pos + sl > dataLen) return;
+        pos += sl;
+    }
+    // Skip hop count if DNET present
+    if (npduControl & 0x20) {
+        if (pos >= dataLen) return;
+        pos++;
+    }
 
     if (pos >= dataLen) return;
 
@@ -335,7 +355,9 @@ void BACnetMSTP::mstpHandleDataFrame(uint8_t src, uint8_t *data, int dataLen, bo
     _txLen = 0;
     // For MSTP, we use a dummy IP for response tracking
     IPAddress mstpDummy(0, 0, 0, src);
+    _processingMSTP = true;
     handleAPDU(&data[pos], dataLen - pos, mstpDummy, src);
+    _processingMSTP = false;
 
     // If we have a response and it's expecting reply, send it via MSTP
     // The response was built in _txBuf by handleAPDU -> sendIPResponse
@@ -421,6 +443,11 @@ void BACnetMSTP::mstpStateMachine() {
 // ============================================================
 
 void BACnetMSTP::sendIPResponse(uint8_t *apdu, int apduLen, IPAddress remoteIP, uint16_t remotePort) {
+    if (apduLen < 0 || (apduLen + 6) > BACNET_BUF_SIZE) {
+        _txLen = 0;
+        return;
+    }
+
     _txLen = 0;
     _txBuf[_txLen++] = 0x81;
     _txBuf[_txLen++] = 0x0A;
@@ -433,7 +460,7 @@ void BACnetMSTP::sendIPResponse(uint8_t *apdu, int apduLen, IPAddress remoteIP, 
     _txBuf[2] = (_txLen >> 8) & 0xFF;
     _txBuf[3] = _txLen & 0xFF;
 
-    if (_ipEnabled && _udp != nullptr) {
+    if (_ipEnabled && !_processingMSTP && _udp != nullptr) {
         _udp->beginPacket(remoteIP, remotePort);
         _udp->write(_txBuf, _txLen);
         _udp->endPacket();

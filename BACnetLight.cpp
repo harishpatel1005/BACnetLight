@@ -5,6 +5,7 @@
  */
 
 #include "BACnetLight.h"
+#include <math.h>
 
 // ============================================================
 // Constructor
@@ -133,6 +134,7 @@ BACnetObject* BACnetLight::addObject(uint16_t type, uint32_t instance, const cha
                                       bool commandable, float relinquishDefault,
                                       const char *description) {
     if (_objectCount >= BACNET_MAX_OBJECTS) return nullptr;
+    if (getObject(type, instance) != nullptr) return nullptr;
 
     BACnetObject *obj = &_objects[_objectCount];
     obj->type = type;
@@ -147,7 +149,10 @@ BACnetObject* BACnetLight::addObject(uint16_t type, uint32_t instance, const cha
     obj->writable = writable;
 
     // COV defaults
-    obj->covIncrement = 0.1f;  // Default: trigger on 0.1 change for analog
+    bool isBinary = (type == BACNET_OBJ_BINARY_INPUT ||
+                     type == BACNET_OBJ_BINARY_OUTPUT ||
+                     type == BACNET_OBJ_BINARY_VALUE);
+    obj->covIncrement = isBinary ? 0.0f : 0.1f;
     obj->lastCovValue = initialValue;
 
     // Priority array (for commandable objects: AO, BO)
@@ -295,7 +300,7 @@ void BACnetLight::sendIAm() {
     _txBuf[_txLen++] = 0x91;
     _txBuf[_txLen++] = 0x03;
 
-    // Vendor ID (uint16_t — tag 0x22 = app-unsigned, 2 bytes, big-endian)
+    // Vendor ID (uint16_t -- tag 0x22 = app-unsigned, 2 bytes, big-endian)
     _txBuf[_txLen++] = 0x22;
     _txBuf[_txLen++] = (_vendorId >> 8) & 0xFF;
     _txBuf[_txLen++] = _vendorId & 0xFF;
@@ -658,9 +663,27 @@ void BACnetLight::handleIPPacket(int packetSize) {
     if (pos >= len) return;
     uint8_t npduControl = _rxBuf[pos++];
 
-    if (npduControl & 0x20) { pos += 2; uint8_t dl = _rxBuf[pos++]; pos += dl; }
-    if (npduControl & 0x08) { pos += 2; uint8_t sl = _rxBuf[pos++]; pos += sl; }
-    if (npduControl & 0x10) pos++; // hop count (bit 4)
+    // Skip DNET/DADR if present (bit 5)
+    if (npduControl & 0x20) {
+        if (pos + 3 > len) return;
+        pos += 2; // DNET
+        uint8_t dl = _rxBuf[pos++];
+        if (pos + dl > len) return;
+        pos += dl;
+    }
+    // Skip SNET/SADR if present (bit 3)
+    if (npduControl & 0x08) {
+        if (pos + 3 > len) return;
+        pos += 2; // SNET
+        uint8_t sl = _rxBuf[pos++];
+        if (pos + sl > len) return;
+        pos += sl;
+    }
+    // Skip hop count if DNET present (bit 5 implies hop count follows)
+    if (npduControl & 0x20) {
+        if (pos >= len) return;
+        pos++;
+    }
 
     if (pos >= len) return;
     handleAPDU(&_rxBuf[pos], len - pos, remoteIP, remotePort);
@@ -688,12 +711,12 @@ void BACnetLight::handleAPDU(uint8_t *apdu, int apduLen, IPAddress remoteIP, uin
             }
             break;
         case BACNET_PDU_SIMPLE_ACK:
-            // apdu[1]=invokeId, apdu[2]=service — ACK for our confirmed COV notification
+            // apdu[1]=invokeId, apdu[2]=service -- ACK for our confirmed COV notification
             if (apduLen >= 3 && apdu[2] == BACNET_SERVICE_CONFIRMED_COV_NOTIF)
                 handleCOVSimpleAck(apdu[1]);
             break;
         case BACNET_PDU_ERROR:
-            // apdu[1]=invokeId, apdu[2]=service — remote rejected our confirmed COV notification
+            // apdu[1]=invokeId, apdu[2]=service -- remote rejected our confirmed COV notification
             if (apduLen >= 3 && apdu[2] == BACNET_SERVICE_CONFIRMED_COV_NOTIF)
                 handleCOVError(apdu[1]);
             break;
@@ -701,6 +724,11 @@ void BACnetLight::handleAPDU(uint8_t *apdu, int apduLen, IPAddress remoteIP, uin
 }
 
 void BACnetLight::sendIPResponse(uint8_t *apdu, int apduLen, IPAddress remoteIP, uint16_t remotePort) {
+    if (apduLen < 0 || (apduLen + 6) > BACNET_BUF_SIZE) {
+        _txLen = 0;
+        return;
+    }
+
     _txLen = 0;
     _txBuf[_txLen++] = 0x81;
     _txBuf[_txLen++] = 0x0A;
@@ -713,7 +741,7 @@ void BACnetLight::sendIPResponse(uint8_t *apdu, int apduLen, IPAddress remoteIP,
     _txBuf[2] = (_txLen >> 8) & 0xFF;
     _txBuf[3] = _txLen & 0xFF;
 
-    if (_ipEnabled) {
+    if (_ipEnabled && !_processingMSTP) {
         if (_udp == nullptr) {
             return;
         }
@@ -802,13 +830,16 @@ void BACnetLight::handleReadPropertyMultiple(uint8_t *apdu, int apduLen, IPAddre
     uint8_t invokeId = apdu[pos++];
     pos++; // service choice
 
-    uint8_t respBuf[480]; int respLen = 0;
+    // Response buffer sized to max APDU (480) minus BVLC+NPDU overhead (6 bytes)
+    static const int RPM_BUF_SIZE = 474;
+    static const int RPM_SAFE_LIMIT = RPM_BUF_SIZE - 80; // stop adding objects near limit
+    uint8_t respBuf[RPM_BUF_SIZE]; int respLen = 0;
     respBuf[respLen++] = BACNET_PDU_COMPLEX_ACK;
     respBuf[respLen++] = invokeId;
     respBuf[respLen++] = BACNET_SERVICE_READ_PROPERTY_MULTIPLE;
 
     // Parse each object specification
-    while (pos < apduLen && respLen < 400) {
+    while (pos < apduLen && respLen < RPM_SAFE_LIMIT) {
         // Object identifier (context tag 0)
         uint8_t ctag = apdu[pos++];
         if ((ctag & 0x0F) != 0x0C) break; // expect context 0, length 4
@@ -829,7 +860,7 @@ void BACnetLight::handleReadPropertyMultiple(uint8_t *apdu, int apduLen, IPAddre
         respLen += encodeOpeningTag(&respBuf[respLen], 1);
 
         // Parse each property reference
-        while (pos < apduLen && apdu[pos] != 0x1F && respLen < 440) {
+        while (pos < apduLen && apdu[pos] != 0x1F && respLen < RPM_SAFE_LIMIT) {
             uint8_t ptag = apdu[pos++];
             int plen = ptag & 0x07;
             if (plen == 5 && pos < apduLen) plen = apdu[pos++];
@@ -850,7 +881,7 @@ void BACnetLight::handleReadPropertyMultiple(uint8_t *apdu, int apduLen, IPAddre
 
             if (valLen >= 0) {
                 respLen += encodeOpeningTag(&respBuf[respLen], 4);
-                if (respLen + valLen < 460) {
+                if (respLen + valLen + 1 < RPM_BUF_SIZE) {
                     memcpy(&respBuf[respLen], valBuf, valLen); respLen += valLen;
                 }
                 respLen += encodeClosingTag(&respBuf[respLen], 4);
@@ -1063,7 +1094,7 @@ void BACnetLight::handleSubscribeCOV(uint8_t *apdu, int apduLen, IPAddress remot
                     _pendingCOV[i].active = false;
             }
         }
-        // ACK regardless — cancelling a non-existent subscription is not an error
+        // ACK regardless -- cancelling a non-existent subscription is not an error
         respBuf[respLen++] = BACNET_PDU_SIMPLE_ACK;
         respBuf[respLen++] = invokeId;
         respBuf[respLen++] = serviceChoice;
@@ -1118,9 +1149,11 @@ void BACnetLight::checkCOV() {
         BACnetObject *obj = &_objects[i];
         bool changed = false;
 
+        if (isnan(obj->presentValue)) continue;
+
         if (obj->type == BACNET_OBJ_BINARY_VALUE || obj->type == BACNET_OBJ_BINARY_INPUT ||
             obj->type == BACNET_OBJ_BINARY_OUTPUT) {
-            // Binary: any change triggers COV
+            // Binary: any state change triggers COV
             changed = ((obj->presentValue > 0.5f) != (obj->lastCovValue > 0.5f));
         } else {
             // Analog: change exceeding increment triggers COV
@@ -1175,9 +1208,12 @@ void BACnetLight::sendConfirmedCOVApdu(uint8_t invokeId, COVSubscription *sub, B
 }
 
 void BACnetLight::sendCOVNotification(COVSubscription *sub, BACnetObject *obj) {
+    if (!sub || !obj) return;
+
     if (sub->issueConfirmedNotifications) {
         // Suppress if a confirmed notification for this subscription is already in flight
         uint8_t subIdx = (uint8_t)(sub - _covSubs);
+        if (subIdx >= BACNET_MAX_COV_SUBSCRIPTIONS) return;
         for (int i = 0; i < BACNET_MAX_COV_SUBSCRIPTIONS; i++) {
             if (_pendingCOV[i].active && _pendingCOV[i].subIndex == subIdx)
                 return;
@@ -1190,11 +1226,14 @@ void BACnetLight::sendCOVNotification(COVSubscription *sub, BACnetObject *obj) {
         }
         if (slot < 0) return; // no room in pending table
 
+        uint8_t objIdx = (uint8_t)(obj - _objects);
+        if (objIdx >= _objectCount) return;
+
         uint8_t id = _invokeId++;
         _pendingCOV[slot].active     = true;
         _pendingCOV[slot].invokeId   = id;
         _pendingCOV[slot].subIndex   = subIdx;
-        _pendingCOV[slot].objIndex   = (uint8_t)(obj - _objects);
+        _pendingCOV[slot].objIndex   = objIdx;
         _pendingCOV[slot].sentTime   = millis();
         _pendingCOV[slot].retryCount = 0;
 
@@ -1255,8 +1294,9 @@ void BACnetLight::handleCOVSimpleAck(uint8_t invokeId) {
 void BACnetLight::handleCOVError(uint8_t invokeId) {
     for (int i = 0; i < BACNET_MAX_COV_SUBSCRIPTIONS; i++) {
         if (_pendingCOV[i].active && _pendingCOV[i].invokeId == invokeId) {
-            // Subscriber explicitly rejected the notification — cancel the subscription
-            _covSubs[_pendingCOV[i].subIndex].active = false;
+            // Subscriber explicitly rejected the notification -- cancel the subscription
+            if (_pendingCOV[i].subIndex < BACNET_MAX_COV_SUBSCRIPTIONS)
+                _covSubs[_pendingCOV[i].subIndex].active = false;
             _pendingCOV[i].active = false;
             return;
         }
@@ -1269,10 +1309,19 @@ void BACnetLight::retryPendingCOV() {
         if (!_pendingCOV[i].active) continue;
         if (now - _pendingCOV[i].sentTime < BACNET_COV_TIMEOUT_MS) continue;
 
+        uint8_t si = _pendingCOV[i].subIndex;
+        uint8_t oi = _pendingCOV[i].objIndex;
+
+        // Validate indices before use
+        if (si >= BACNET_MAX_COV_SUBSCRIPTIONS || oi >= _objectCount) {
+            _pendingCOV[i].active = false;
+            continue;
+        }
+
         if (_pendingCOV[i].retryCount >= BACNET_COV_MAX_RETRIES ||
-            !_covSubs[_pendingCOV[i].subIndex].active) {
-            // Retries exhausted or subscription already gone — cancel both
-            _covSubs[_pendingCOV[i].subIndex].active = false;
+            !_covSubs[si].active) {
+            // Retries exhausted or subscription already gone -- cancel both
+            _covSubs[si].active = false;
             _pendingCOV[i].active = false;
             continue;
         }
@@ -1281,7 +1330,6 @@ void BACnetLight::retryPendingCOV() {
         _pendingCOV[i].retryCount++;
         _pendingCOV[i].sentTime = now;
         sendConfirmedCOVApdu(_pendingCOV[i].invokeId,
-                             &_covSubs[_pendingCOV[i].subIndex],
-                             &_objects[_pendingCOV[i].objIndex]);
+                             &_covSubs[si], &_objects[oi]);
     }
 }

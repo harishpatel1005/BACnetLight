@@ -8,7 +8,7 @@
  * 
  * How to test with YABE:
  * 1. Discover this device
- * 2. Right-click an object → Subscribe
+ * 2. Right-click an object -> Subscribe
  * 3. Watch the Subscriptions panel update automatically
  * 
  * Hardware: ESP32 + W5500 Ethernet
@@ -21,7 +21,7 @@
 
 byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
 IPAddress ip(192, 168, 1, 200);
-IPAddress bacnetTarget(192, 168, 1, 100);
+IPAddress bacnetTarget(192, 168, 1, 255);  // Subnet broadcast for BACnet discovery
 
 BACnetLight bacnet;
 EthernetUDP bacnetUdp;
@@ -43,7 +43,10 @@ void setup() {
     Serial.print("IP: ");
     Serial.println(Ethernet.localIP());
 
-    bacnet.begin(2000, "COV-Demo-Device", bacnetTarget, bacnetUdp);
+    if (!bacnet.begin(2000, "COV-Demo-Device", bacnetTarget, bacnetUdp)) {
+        Serial.println("ERROR: BACnet init failed!");
+        while (1) delay(1000);
+    }
 
     // Analog sensor - COV triggers on 1.0 degree change
     bacnet.addAnalogValue(0, "Temperature", 22.0, BACNET_UNITS_DEGREES_CELSIUS,

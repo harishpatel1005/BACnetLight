@@ -12,7 +12,7 @@
 
 byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
 IPAddress ip(192, 168, 1, 200);
-IPAddress bacnetTarget(192, 168, 1, 100);
+IPAddress bacnetTarget(192, 168, 1, 255);  // Subnet broadcast for BACnet discovery
 
 BACnetLight bacnet;
 EthernetUDP bacnetUdp;
@@ -27,7 +27,10 @@ void setup() {
     Serial.print("IP: ");
     Serial.println(Ethernet.localIP());
 
-    bacnet.begin(1234, "My-First-BACnet", bacnetTarget, bacnetUdp);
+    if (!bacnet.begin(1234, "My-First-BACnet", bacnetTarget, bacnetUdp)) {
+        Serial.println("ERROR: BACnet init failed!");
+        while (1) delay(1000);
+    }
     bacnet.addAnalogValue(0, "Temperature", 22.5, BACNET_UNITS_DEGREES_CELSIUS);
 
     Serial.println("BACnet ready!");
