@@ -20,29 +20,6 @@
 #define MSTP_PREAMBLE2  0xFF
 
 // ============================================================
-// CRC Tables
-// ============================================================
-
-static const uint8_t HeaderCRC_Table[256] = {
-    0x00,0xFE,0xFF,0x01,0xFD,0x03,0x02,0xFC,0xF9,0x07,0x06,0xF8,0x04,0xFA,0xFB,0x05,
-    0xF1,0x0F,0x0E,0xF0,0x0C,0xF2,0xF3,0x0D,0x08,0xF6,0xF7,0x09,0xF5,0x0B,0x0A,0xF4,
-    0xE1,0x1F,0x1E,0xE0,0x1C,0xE2,0xE3,0x1D,0x18,0xE6,0xE7,0x19,0xE5,0x1B,0x1A,0xE4,
-    0x10,0xEE,0xEF,0x11,0xED,0x13,0x12,0xEC,0xE9,0x17,0x16,0xE8,0x14,0xEA,0xEB,0x15,
-    0xC1,0x3F,0x3E,0xC0,0x3C,0xC2,0xC3,0x3D,0x38,0xC6,0xC7,0x39,0xC5,0x3B,0x3A,0xC4,
-    0x30,0xCE,0xCF,0x31,0xCD,0x33,0x32,0xCC,0xC9,0x37,0x36,0xC8,0x34,0xCA,0xCB,0x35,
-    0x20,0xDE,0xDF,0x21,0xDD,0x23,0x22,0xDC,0xD9,0x27,0x26,0xD8,0x24,0xDA,0xDB,0x25,
-    0xD1,0x2F,0x2E,0xD0,0x2C,0xD2,0xD3,0x2D,0x28,0xD6,0xD7,0x29,0xD5,0x2B,0x2A,0xD4,
-    0x81,0x7F,0x7E,0x80,0x7C,0x82,0x83,0x7D,0x78,0x86,0x87,0x79,0x85,0x7B,0x7A,0x84,
-    0x70,0x8E,0x8F,0x71,0x8D,0x73,0x72,0x8C,0x89,0x77,0x76,0x88,0x74,0x8A,0x8B,0x75,
-    0x60,0x9E,0x9F,0x61,0x9D,0x63,0x62,0x9C,0x99,0x67,0x66,0x98,0x64,0x9A,0x9B,0x65,
-    0x91,0x6F,0x6E,0x90,0x6C,0x92,0x93,0x6D,0x68,0x96,0x97,0x69,0x95,0x6B,0x6A,0x94,
-    0x40,0xBE,0xBF,0x41,0xBD,0x43,0x42,0xBC,0xB9,0x47,0x46,0xB8,0x44,0xBA,0xBB,0x45,
-    0xB1,0x4F,0x4E,0xB0,0x4C,0xB2,0xB3,0x4D,0x48,0xB6,0xB7,0x49,0xB5,0x4B,0x4A,0xB4,
-    0x50,0xAE,0xAF,0x51,0xAD,0x53,0x52,0xAC,0xA9,0x57,0x56,0xA8,0x54,0xAA,0xAB,0x55,
-    0xA1,0x5F,0x5E,0xA0,0x5C,0xA2,0xA3,0x5D,0x58,0xA6,0xA7,0x59,0xA5,0x5B,0x5A,0xA4
-};
-
-// ============================================================
 // Constructor
 // ============================================================
 
@@ -61,6 +38,12 @@ BACnetMSTP::BACnetMSTP() : BACnetLight() {
     _retryCount = 0;
     _framePending = 0;
     _mstpRxLen = 0;
+    _mstpTxPending = false;
+    _mstpTxDest = 0xFF;
+    _mstpTxDataLen = 0;
+    _lastIAmMs = 0;
+    memset(_masterMap, 0, sizeof(_masterMap));
+    _pollAddr = 0;
 }
 
 // ============================================================
@@ -94,6 +77,8 @@ bool BACnetMSTP::beginMSTP(uint32_t deviceInstance, const char *deviceName,
     _tokenTimer = millis();
     _tokenCount = 0;
 
+    sendIAm();
+    _lastIAmMs = millis();
     return true;
 }
 
@@ -131,6 +116,11 @@ void BACnetMSTP::loop() {
     if (_mstpEnabled) {
         mstpReceive();
         mstpStateMachine();
+
+        if (millis() - _lastIAmMs >= 60000UL) {
+            _lastIAmMs = millis();
+            sendIAm();
+        }
     }
 }
 
@@ -148,21 +138,27 @@ void BACnetMSTP::setTxMode(bool tx) {
 // ============================================================
 
 uint8_t BACnetMSTP::calcHeaderCRC(uint8_t *buf, int len) {
+    // ASHRAE 135-2016 Clause 9.3.2 header CRC, computed bit-by-bit.
     uint8_t crc = 0xFF;
     for (int i = 0; i < len; i++) {
-        crc = HeaderCRC_Table[crc ^ buf[i]];
+        uint16_t c = (uint16_t)(crc ^ buf[i]);
+        c = c ^ (c << 1) ^ (c << 2) ^ (c << 3)
+              ^ (c << 4) ^ (c << 5) ^ (c << 6) ^ (c << 7);
+        crc = (uint8_t)((c & 0xFE) ^ ((c >> 8) & 1));
     }
     return ~crc;
 }
 
 uint16_t BACnetMSTP::calcDataCRC(uint8_t *buf, int len) {
-    // BACnet MSTP data CRC uses CRC-16/IBM (poly 0xA001, reflected)
+    // ASHRAE 135-2016 Clause 9.3.3 data CRC: CRC-CCITT, polynomial
+    // X^16 + X^12 + X^5 + 1 (0x1021), reflected form 0x8408.
+    // Init 0xFFFF, final one's-complement, emitted low byte then high byte.
     uint16_t crc = 0xFFFF;
     for (int i = 0; i < len; i++) {
         crc ^= (uint8_t)buf[i];
         for (int j = 0; j < 8; j++) {
             if (crc & 0x0001)
-                crc = (crc >> 1) ^ 0xA001;
+                crc = (crc >> 1) ^ 0x8408;
             else
                 crc >>= 1;
         }
@@ -277,6 +273,9 @@ void BACnetMSTP::mstpReceive() {
 
 void BACnetMSTP::mstpHandleFrame(uint8_t frameType, uint8_t src, uint8_t dest,
                                    uint8_t *data, int dataLen) {
+    // Any frame we hear identifies its source as a live master on the bus.
+    markMaster(src);
+
     switch (frameType) {
         case MSTP_FRAME_TOKEN:
             if (dest == _macAddress) {
@@ -295,8 +294,13 @@ void BACnetMSTP::mstpHandleFrame(uint8_t frameType, uint8_t src, uint8_t dest,
             break;
 
         case MSTP_FRAME_BACNET_DATA_EXPECTING_REPLY:
-            if (dest == _macAddress || dest == 0xFF) {
+            // Only a unicast request may be answered. A broadcast
+            // Data-Expecting-Reply is processed but never replied to
+            // (you cannot reply to a broadcast, and doing so collides).
+            if (dest == _macAddress) {
                 mstpHandleDataFrame(src, data, dataLen, true);
+            } else if (dest == 0xFF) {
+                mstpHandleDataFrame(src, data, dataLen, false);
             }
             break;
 
@@ -322,7 +326,7 @@ void BACnetMSTP::mstpHandleDataFrame(uint8_t src, uint8_t *data, int dataLen, bo
     if (dataLen < 3) return;
 
     // NPDU starts at data[0]
-    uint8_t npduVersion = data[0];
+    if (data[0] != 0x01) return; // reject non-v1 NPDUs
     uint8_t npduControl = data[1];
     int pos = 2;
 
@@ -359,13 +363,46 @@ void BACnetMSTP::mstpHandleDataFrame(uint8_t src, uint8_t *data, int dataLen, bo
     handleAPDU(&data[pos], dataLen - pos, mstpDummy, src);
     _processingMSTP = false;
 
-    // If we have a response and it's expecting reply, send it via MSTP
-    // The response was built in _txBuf by handleAPDU -> sendIPResponse
-    // We need to re-route it over MSTP instead
+    // A confirmed-request reply is time-critical: the requesting node is
+    // sitting in WAIT_FOR_REPLY and will abandon the transaction after
+    // Treply_timeout (~255 ms). It does NOT wait for us to next hold the
+    // token, so the reply must be sent NOW, directly, while we still own the
+    // medium. (Deferring it to the next token hold -- the old behaviour --
+    // meant every ReadProperty silently timed out, which is why YABE could
+    // discover the device but never read its object list.)
+    //
+    // The response APDU lives in _txBuf as [BVLC(4)][NPDU(01 00)][APDU];
+    // skip the 4-byte BVLC and transmit the NPDU+APDU as the MSTP payload.
     if (expectingReply && _txLen > 6) {
-        // Strip BVLC header (4 bytes), send NPDU+APDU via MSTP
-        mstpSendFrame(MSTP_FRAME_BACNET_DATA_NOT_EXPECTING, src, &_txBuf[4], _txLen - 4);
+        int replyLen = _txLen - 4;
+        mstpSendFrame(MSTP_FRAME_BACNET_DATA_NOT_EXPECTING, src,
+                      &_txBuf[4], replyLen);
     }
+}
+
+// ============================================================
+// Known-master tracking
+// ============================================================
+
+void BACnetMSTP::markMaster(uint8_t mac) {
+    if (mac < 128 && mac != _macAddress)
+        _masterMap[mac >> 3] |= (uint8_t)(1 << (mac & 7));
+}
+
+bool BACnetMSTP::isMaster(uint8_t mac) {
+    if (mac >= 128) return false;
+    return (_masterMap[mac >> 3] & (uint8_t)(1 << (mac & 7))) != 0;
+}
+
+int BACnetMSTP::nextKnownMaster() {
+    // Walk circularly from the address just above ours; return the first known
+    // master. This is the MS/TP successor (next master in address order).
+    for (int i = 1; i <= _maxMaster + 1; i++) {
+        uint8_t cand = (uint8_t)((_macAddress + i) % (_maxMaster + 1));
+        if (cand == _macAddress) continue;
+        if (isMaster(cand)) return cand;
+    }
+    return -1;
 }
 
 // ============================================================
@@ -395,34 +432,49 @@ void BACnetMSTP::mstpStateMachine() {
             break;
 
         case MSTP_USE_TOKEN:
-            // We have the token - send any pending data or pass it
-            if (now - _tokenTimer < MSTP_T_USAGE_TIMEOUT) {
-                // We could send queued data here
-                // For now, just pass the token
+            if (_mstpTxPending) {
+                mstpSendFrame(MSTP_FRAME_BACNET_DATA_NOT_EXPECTING,
+                              _mstpTxDest, _mstpTxBuf, _mstpTxDataLen);
+                _mstpTxPending = false;
             }
             _mstpState = MSTP_PASS_TOKEN;
             break;
 
-        case MSTP_PASS_TOKEN:
-            // Pass token to next station
+        case MSTP_PASS_TOKEN: {
+            int ns = nextKnownMaster();
+            if (ns < 0) {
+                // No peer discovered yet. Stay sole master: drop to idle and let
+                // NO_TOKEN recovery keep us alive until another master (e.g. the
+                // BACnet client) polls us or sends us the token. Marching through
+                // every dead address here is what made the token take minutes to
+                // return to the client, starving ReadProperty.
+                _hasToken = false;
+                _mstpState = MSTP_IDLE;
+                _silenceTimer = now;
+                break;
+            }
+
+            _nextStation = (uint8_t)ns;
             mstpSendToken(_nextStation);
             _hasToken = false;
             _mstpState = MSTP_IDLE;
             _silenceTimer = now;
 
-            // Periodically poll for new masters
+            // Periodically poll for masters that may have joined since.
             if (_tokenCount >= MSTP_N_POLL_STATION) {
                 _tokenCount = 0;
                 _mstpState = MSTP_POLL_FOR_MASTER;
             }
             break;
+        }
 
         case MSTP_POLL_FOR_MASTER: {
-            // Poll next address after our next station
-            uint8_t pollAddr = (_nextStation + 1) % (_maxMaster + 1);
-            if (pollAddr != _macAddress) {
-                mstpSendFrame(MSTP_FRAME_POLL_FOR_MASTER, pollAddr, nullptr, 0);
-            }
+            // Probe one address per visit; a Reply-To-PFM (or any frame) from it
+            // is recorded by markMaster() and becomes a token target.
+            do {
+                _pollAddr = (_pollAddr + 1) % (_maxMaster + 1);
+            } while (_pollAddr == _macAddress);
+            mstpSendFrame(MSTP_FRAME_POLL_FOR_MASTER, _pollAddr, nullptr, 0);
             _mstpState = MSTP_IDLE;
             _silenceTimer = now;
             break;
@@ -465,4 +517,31 @@ void BACnetMSTP::sendIPResponse(uint8_t *apdu, int apduLen, IPAddress remoteIP, 
         _udp->write(_txBuf, _txLen);
         _udp->endPacket();
     }
+}
+
+// ============================================================
+// sendIAm Override
+// Builds the I-Am via the base class (which also handles UDP in
+// dual-port mode), then queues the NPDU+APDU for the next token.
+// ============================================================
+
+void BACnetMSTP::sendIAm() {
+    BACnetLight::sendIAm(); // builds _txBuf and handles UDP in dual-port mode
+
+    if (!_mstpEnabled || _txLen <= 10) return;
+
+    // _txBuf layout: [0..3]=BVLC, [4..9]=6-byte global-broadcast NPDU, [10..]=APDU.
+    // The IP-form NPDU (DNET=0xFFFF) is wrong for a local MSTP broadcast.
+    // Build the MSTP payload with a 2-byte local-broadcast NPDU instead.
+    int apduLen = _txLen - 10;
+    int n = 2 + apduLen;
+    if (n > (int)sizeof(_mstpTxBuf)) return;
+
+    _mstpTxBuf[0] = 0x01; // NPDU version
+    _mstpTxBuf[1] = 0x00; // local broadcast, no special flags
+    memcpy(&_mstpTxBuf[2], &_txBuf[10], apduLen);
+
+    _mstpTxDataLen = n;
+    _mstpTxDest    = 0xFF;
+    _mstpTxPending = true;
 }

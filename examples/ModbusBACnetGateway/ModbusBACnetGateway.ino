@@ -78,6 +78,10 @@ void setup() {
     Ethernet.init(ETH_CS);
     Ethernet.begin(mac, ip);
     delay(2000);
+    if (Ethernet.hardwareStatus() == EthernetNoHardware) {
+        Serial.println("ERROR: No W5500 Ethernet controller found - check wiring.");
+        while (1) delay(1000);
+    }
     Serial.print("IP: ");
     Serial.println(Ethernet.localIP());
 

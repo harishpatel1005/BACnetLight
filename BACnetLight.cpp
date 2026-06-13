@@ -21,6 +21,7 @@ BACnetLight::BACnetLight() {
     _ipEnabled = false;
     _processingMSTP = false;
     _invokeId = 0;
+    _lastCOVExpiry = 0;
 
     memset(_deviceName, 0, sizeof(_deviceName));
     memset(_vendorName, 0, sizeof(_vendorName));
@@ -442,7 +443,7 @@ int BACnetLight::encodeAppNull(uint8_t *buf) {
 // Property Encoding
 // ============================================================
 
-int BACnetLight::encodeDeviceProperty(uint8_t *buf, uint32_t property) {
+int BACnetLight::encodeDeviceProperty(uint8_t *buf, uint32_t property, int32_t arrayIndex) {
     int pos = 0;
     switch (property) {
         case BACNET_PROP_OBJECT_IDENTIFIER:
@@ -477,10 +478,46 @@ int BACnetLight::encodeDeviceProperty(uint8_t *buf, uint32_t property) {
             pos += encodeAppUnsigned(&buf[pos], 3); break;
         case BACNET_PROP_DATABASE_REVISION:
             pos += encodeAppUnsigned(&buf[pos], 1); break;
+        case BACNET_PROP_PROTOCOL_SERVICES_SUPPORTED: {
+            // BACnetServicesSupported (40 bits). Bits set for the services this
+            // library implements: confirmedCOVNotification(1), subscribeCOV(5),
+            // readProperty(12), readPropertyMultiple(14), writeProperty(15),
+            // iAm(26), unconfirmedCOVNotification(28), whoIs(34).
+            static const uint8_t svc[5] = { 0x44, 0x0B, 0x00, 0x28, 0x20 };
+            buf[pos++] = (BACNET_TAG_BIT_STRING << 4) | 5; // extended length
+            buf[pos++] = 6;   // length = 1 unused-bits byte + 5 data bytes
+            buf[pos++] = 0;   // 0 unused bits (40 bits == 5 octets)
+            for (int i = 0; i < 5; i++) buf[pos++] = svc[i];
+            break;
+        }
+        case BACNET_PROP_PROTOCOL_OBJECT_TYPES_SUPPORTED: {
+            // BACnetObjectTypesSupported (16 bits): AI,AO,AV,BI,BO,BV (0-5) + device(8).
+            static const uint8_t ot[2] = { 0xFC, 0x80 };
+            buf[pos++] = (BACNET_TAG_BIT_STRING << 4) | 3; // length 3 (fits inline)
+            buf[pos++] = 0;   // 0 unused bits (16 bits == 2 octets)
+            buf[pos++] = ot[0]; buf[pos++] = ot[1];
+            break;
+        }
         case BACNET_PROP_OBJECT_LIST: {
-            pos += encodeAppObjectId(&buf[pos], BACNET_OBJ_DEVICE, _deviceInstance);
-            for (uint8_t i = 0; i < _objectCount; i++)
-                pos += encodeAppObjectId(&buf[pos], _objects[i].type, _objects[i].instance);
+            // Element 1 is the Device object itself, then each added object.
+            if (arrayIndex == 0) {
+                // Array element count
+                pos += encodeAppUnsigned(&buf[pos], (uint32_t)_objectCount + 1);
+            } else if (arrayIndex > 0) {
+                if (arrayIndex == 1)
+                    pos += encodeAppObjectId(&buf[pos], BACNET_OBJ_DEVICE, _deviceInstance);
+                else if ((uint32_t)(arrayIndex - 2) < _objectCount)
+                    pos += encodeAppObjectId(&buf[pos],
+                                             _objects[arrayIndex - 2].type,
+                                             _objects[arrayIndex - 2].instance);
+                else
+                    return -1; // invalid array index
+            } else {
+                // Whole list
+                pos += encodeAppObjectId(&buf[pos], BACNET_OBJ_DEVICE, _deviceInstance);
+                for (uint8_t i = 0; i < _objectCount; i++)
+                    pos += encodeAppObjectId(&buf[pos], _objects[i].type, _objects[i].instance);
+            }
             break;
         }
         default: return -1;
@@ -504,7 +541,7 @@ int BACnetLight::encodePriorityArray(uint8_t *buf, BACnetObject *obj) {
     return pos;
 }
 
-int BACnetLight::encodeObjectProperty(uint8_t *buf, BACnetObject *obj, uint32_t property) {
+int BACnetLight::encodeObjectProperty(uint8_t *buf, BACnetObject *obj, uint32_t property, int32_t arrayIndex) {
     int pos = 0;
     switch (property) {
         case BACNET_PROP_OBJECT_IDENTIFIER:
@@ -542,9 +579,21 @@ int BACnetLight::encodeObjectProperty(uint8_t *buf, BACnetObject *obj, uint32_t 
             } else { return -1; }
             break;
         case BACNET_PROP_PRIORITY_ARRAY:
-            if (obj->hasPriorityArray) {
+            if (!obj->hasPriorityArray) return -1;
+            if (arrayIndex == 0) {
+                pos += encodeAppUnsigned(&buf[pos], BACNET_NUM_PRIORITIES);
+            } else if (arrayIndex > 0) {
+                if ((uint32_t)arrayIndex > BACNET_NUM_PRIORITIES) return -1;
+                int i = arrayIndex - 1;
+                if (isnan(obj->priorityArray[i]))
+                    pos += encodeAppNull(&buf[pos]);
+                else if (obj->type == BACNET_OBJ_BINARY_OUTPUT)
+                    pos += encodeAppEnumerated(&buf[pos], obj->priorityArray[i] > 0.5f ? 1 : 0);
+                else
+                    pos += encodeAppReal(&buf[pos], obj->priorityArray[i]);
+            } else {
                 pos += encodePriorityArray(&buf[pos], obj);
-            } else { return -1; }
+            }
             break;
         case BACNET_PROP_RELINQUISH_DEFAULT:
             if (obj->hasPriorityArray) {
@@ -564,12 +613,12 @@ int BACnetLight::encodeObjectProperty(uint8_t *buf, BACnetObject *obj, uint32_t 
     return pos;
 }
 
-int BACnetLight::encodePropertyValue(uint8_t *buf, uint16_t objectType, uint32_t instance, uint32_t property) {
+int BACnetLight::encodePropertyValue(uint8_t *buf, uint16_t objectType, uint32_t instance, uint32_t property, int32_t arrayIndex) {
     if (objectType == BACNET_OBJ_DEVICE)
-        return encodeDeviceProperty(buf, property);
+        return encodeDeviceProperty(buf, property, arrayIndex);
     BACnetObject *obj = getObject(objectType, instance);
     if (!obj) return -1;
-    return encodeObjectProperty(buf, obj, property);
+    return encodeObjectProperty(buf, obj, property, arrayIndex);
 }
 
 int BACnetLight::encodeCOVPropertyList(uint8_t *buf, BACnetObject *obj) {
@@ -793,9 +842,20 @@ void BACnetLight::handleReadProperty(uint8_t *apdu, int apduLen, IPAddress remot
         for (int i = 0; i < t1l && pos < apduLen; i++) propertyId = (propertyId << 8) | apdu[pos++];
     }
 
+    // Optional array index (context tag 2). Clients commonly read object-list
+    // element-by-element: [0]=count, [1..n]=each member.
+    int32_t arrayIndex = -1;
+    if (pos < apduLen && (apdu[pos] & 0xF8) == 0x28) {
+        uint8_t t2 = apdu[pos++]; int t2l = t2 & 0x07;
+        if (t2l == 5 && pos < apduLen) t2l = apdu[pos++];
+        uint32_t ai = 0;
+        for (int i = 0; i < t2l && pos < apduLen; i++) ai = (ai << 8) | apdu[pos++];
+        arrayIndex = (int32_t)ai;
+    }
+
     uint8_t respBuf[256]; int respLen = 0;
     uint8_t valueBuf[256];
-    int valueLen = encodePropertyValue(valueBuf, objectType, instance, propertyId);
+    int valueLen = encodePropertyValue(valueBuf, objectType, instance, propertyId, arrayIndex);
 
     if (valueLen < 0) {
         respBuf[respLen++] = BACNET_PDU_ERROR;
@@ -811,6 +871,8 @@ void BACnetLight::handleReadProperty(uint8_t *apdu, int apduLen, IPAddress remot
         respLen += encodeContextTag(&respBuf[respLen], 0, oid, 4);
         if (propertyId < 0x100) respLen += encodeContextTag(&respBuf[respLen], 1, propertyId, 1);
         else respLen += encodeContextTag(&respBuf[respLen], 1, propertyId, 2);
+        // Echo the array index back when one was requested (required by spec).
+        if (arrayIndex >= 0) respLen += encodeContextUnsigned(&respBuf[respLen], 2, (uint32_t)arrayIndex);
         respLen += encodeOpeningTag(&respBuf[respLen], 3);
         memcpy(&respBuf[respLen], valueBuf, valueLen); respLen += valueLen;
         respLen += encodeClosingTag(&respBuf[respLen], 3);
@@ -823,83 +885,150 @@ void BACnetLight::handleReadProperty(uint8_t *apdu, int apduLen, IPAddress remot
 // ReadPropertyMultiple
 // ============================================================
 
+int BACnetLight::rpmPropertyList(uint16_t objectType, BACnetObject *obj, uint32_t *out, int maxOut) {
+    int n = 0;
+    #define RPM_ADD(p) do { if (n < maxOut) out[n++] = (uint32_t)(p); } while (0)
+    RPM_ADD(BACNET_PROP_OBJECT_IDENTIFIER);
+    RPM_ADD(BACNET_PROP_OBJECT_NAME);
+    RPM_ADD(BACNET_PROP_OBJECT_TYPE);
+    if (objectType == BACNET_OBJ_DEVICE) {
+        RPM_ADD(BACNET_PROP_SYSTEM_STATUS);
+        RPM_ADD(BACNET_PROP_VENDOR_NAME);
+        RPM_ADD(BACNET_PROP_VENDOR_IDENTIFIER);
+        RPM_ADD(BACNET_PROP_MODEL_NAME);
+        RPM_ADD(BACNET_PROP_FIRMWARE_REVISION);
+        RPM_ADD(BACNET_PROP_APP_SOFTWARE_VERSION);
+        RPM_ADD(BACNET_PROP_PROTOCOL_VERSION);
+        RPM_ADD(BACNET_PROP_PROTOCOL_REVISION);
+        RPM_ADD(BACNET_PROP_PROTOCOL_SERVICES_SUPPORTED);
+        RPM_ADD(BACNET_PROP_PROTOCOL_OBJECT_TYPES_SUPPORTED);
+        RPM_ADD(BACNET_PROP_MAX_APDU_LENGTH);
+        RPM_ADD(BACNET_PROP_SEGMENTATION_SUPPORTED);
+        RPM_ADD(BACNET_PROP_APDU_TIMEOUT);
+        RPM_ADD(BACNET_PROP_NUM_APDU_RETRIES);
+        RPM_ADD(BACNET_PROP_DATABASE_REVISION);
+        // object-list intentionally omitted from "all" (read via RP by index)
+    } else {
+        RPM_ADD(BACNET_PROP_PRESENT_VALUE);
+        RPM_ADD(BACNET_PROP_STATUS_FLAGS);
+        RPM_ADD(BACNET_PROP_EVENT_STATE);
+        RPM_ADD(BACNET_PROP_OUT_OF_SERVICE);
+        RPM_ADD(BACNET_PROP_DESCRIPTION);
+        bool analog = (objectType == BACNET_OBJ_ANALOG_INPUT ||
+                       objectType == BACNET_OBJ_ANALOG_OUTPUT ||
+                       objectType == BACNET_OBJ_ANALOG_VALUE);
+        if (analog) { RPM_ADD(BACNET_PROP_UNITS); RPM_ADD(BACNET_PROP_COV_INCREMENT); }
+        if (objectType == BACNET_OBJ_BINARY_INPUT || objectType == BACNET_OBJ_BINARY_OUTPUT)
+            RPM_ADD(BACNET_PROP_POLARITY);
+        if (obj && obj->hasPriorityArray) {
+            RPM_ADD(BACNET_PROP_PRIORITY_ARRAY);
+            RPM_ADD(BACNET_PROP_RELINQUISH_DEFAULT);
+        }
+    }
+    #undef RPM_ADD
+    return n;
+}
+
+int BACnetLight::emitRPMResult(uint8_t *buf, int maxLen, uint16_t objectType, uint32_t instance,
+                               uint32_t property, int32_t arrayIndex) {
+    uint8_t tmp[300];
+    int p = 0;
+    // propertyIdentifier [2] (primitive context tag)
+    if (property < 0x100) p += encodeContextTag(&tmp[p], 2, property, 1);
+    else                  p += encodeContextTag(&tmp[p], 2, property, 2);
+    // propertyArrayIndex [3] (optional)
+    if (arrayIndex >= 0) p += encodeContextUnsigned(&tmp[p], 3, (uint32_t)arrayIndex);
+
+    uint8_t valBuf[256];
+    int valLen = encodePropertyValue(valBuf, objectType, instance, property, arrayIndex);
+    if (valLen >= 0 && valLen <= (int)sizeof(valBuf) && (p + valLen + 2) <= (int)sizeof(tmp)) {
+        // propertyValue [4]
+        p += encodeOpeningTag(&tmp[p], 4);
+        memcpy(&tmp[p], valBuf, valLen); p += valLen;
+        p += encodeClosingTag(&tmp[p], 4);
+    } else {
+        // propertyAccessError [5] : property / unknown-property
+        p += encodeOpeningTag(&tmp[p], 5);
+        p += encodeAppEnumerated(&tmp[p], 2);
+        p += encodeAppEnumerated(&tmp[p], 32);
+        p += encodeClosingTag(&tmp[p], 5);
+    }
+
+    if (p > maxLen) return 0; // would not fit; caller stops adding
+    memcpy(buf, tmp, p);
+    return p;
+}
+
 void BACnetLight::handleReadPropertyMultiple(uint8_t *apdu, int apduLen, IPAddress remoteIP, uint16_t remotePort) {
     int pos = 0;
     pos++; // pdu type
-    pos++; // max info
+    pos++; // max segments / max APDU
     uint8_t invokeId = apdu[pos++];
     pos++; // service choice
 
-    // Response buffer sized to max APDU (480) minus BVLC+NPDU overhead (6 bytes)
-    static const int RPM_BUF_SIZE = 474;
-    static const int RPM_SAFE_LIMIT = RPM_BUF_SIZE - 80; // stop adding objects near limit
-    uint8_t respBuf[RPM_BUF_SIZE]; int respLen = 0;
+    // Logical APDU payload limit (480 max APDU minus BVLC+NPDU). The physical
+    // array carries a little slack so trailing closing tags never overflow.
+    static const int RPM_LIMIT = 474;
+    uint8_t respBuf[RPM_LIMIT + 16]; int respLen = 0;
     respBuf[respLen++] = BACNET_PDU_COMPLEX_ACK;
     respBuf[respLen++] = invokeId;
     respBuf[respLen++] = BACNET_SERVICE_READ_PROPERTY_MULTIPLE;
 
-    // Parse each object specification
-    while (pos < apduLen && respLen < RPM_SAFE_LIMIT) {
-        // Object identifier (context tag 0)
-        uint8_t ctag = apdu[pos++];
-        if ((ctag & 0x0F) != 0x0C) break; // expect context 0, length 4
-
-        uint16_t objectType = 0; uint32_t instance = 0;
+    // Parse each Read-Access-Specification
+    while (pos < apduLen && respLen < RPM_LIMIT - 8) {
+        // objectIdentifier: context tag 0, length 4
+        if ((apdu[pos] & 0xF8) != 0x08) break;       // expect context tag 0
+        uint8_t octag = apdu[pos++]; int olen = octag & 0x07;
+        if (olen != 4 || pos + 4 > apduLen) break;
         uint32_t oid = ((uint32_t)apdu[pos]<<24)|((uint32_t)apdu[pos+1]<<16)|
                        ((uint32_t)apdu[pos+2]<<8)|apdu[pos+3];
-        objectType = (oid >> 22) & 0x3FF; instance = oid & 0x3FFFFF; pos += 4;
+        uint16_t objectType = (oid >> 22) & 0x3FF;
+        uint32_t instance = oid & 0x3FFFFF;
+        pos += 4;
 
-        // Opening tag 1 (list of property references)
+        // listOfPropertyReferences: opening tag 1
         if (pos < apduLen && apdu[pos] == 0x1E) pos++;
 
-        // Object identifier in response
-        respLen += encodeOpeningTag(&respBuf[respLen], 0);
-        respLen += encodeAppObjectId(&respBuf[respLen], objectType, instance);
-
-        // List of results opening tag 1
+        // ReadAccessResult: objectIdentifier [0] primitive, then listOfResults [1]
+        respLen += encodeContextTag(&respBuf[respLen], 0, oid, 4);
         respLen += encodeOpeningTag(&respBuf[respLen], 1);
 
-        // Parse each property reference
-        while (pos < apduLen && apdu[pos] != 0x1F && respLen < RPM_SAFE_LIMIT) {
-            uint8_t ptag = apdu[pos++];
-            int plen = ptag & 0x07;
+        // Each property reference
+        while (pos < apduLen && apdu[pos] != 0x1F && respLen < RPM_LIMIT - 8) {
+            // propertyIdentifier: context tag 0
+            uint8_t ptag = apdu[pos++]; int plen = ptag & 0x07;
             if (plen == 5 && pos < apduLen) plen = apdu[pos++];
-
             uint32_t propId = 0;
-            for (int i = 0; i < plen && pos < apduLen; i++)
-                propId = (propId << 8) | apdu[pos++];
+            for (int i = 0; i < plen && pos < apduLen; i++) propId = (propId << 8) | apdu[pos++];
 
-            // Encode result for this property
-            respLen += encodeOpeningTag(&respBuf[respLen], 2);
-            if (propId < 0x100)
-                respLen += encodeContextTag(&respBuf[respLen], 2, propId, 1);
-            else
-                respLen += encodeContextTag(&respBuf[respLen], 2, propId, 2);
-
-            uint8_t valBuf[128];
-            int valLen = encodePropertyValue(valBuf, objectType, instance, propId);
-
-            if (valLen >= 0) {
-                respLen += encodeOpeningTag(&respBuf[respLen], 4);
-                if (respLen + valLen + 1 < RPM_BUF_SIZE) {
-                    memcpy(&respBuf[respLen], valBuf, valLen); respLen += valLen;
-                }
-                respLen += encodeClosingTag(&respBuf[respLen], 4);
-            } else {
-                // Error for this property
-                respLen += encodeOpeningTag(&respBuf[respLen], 5);
-                respLen += encodeAppEnumerated(&respBuf[respLen], 2);
-                respLen += encodeAppEnumerated(&respBuf[respLen], 32);
-                respLen += encodeClosingTag(&respBuf[respLen], 5);
+            // optional propertyArrayIndex: context tag 1
+            int32_t refIndex = -1;
+            if (pos < apduLen && (apdu[pos] & 0xF8) == 0x18) {
+                uint8_t atag = apdu[pos++]; int alen = atag & 0x07;
+                if (alen == 5 && pos < apduLen) alen = apdu[pos++];
+                uint32_t ai = 0;
+                for (int i = 0; i < alen && pos < apduLen; i++) ai = (ai << 8) | apdu[pos++];
+                refIndex = (int32_t)ai;
             }
-            respLen += encodeClosingTag(&respBuf[respLen], 2);
+
+            if (propId == 8 || propId == 105 || propId == 80) {
+                // all / required / optional -> expand to concrete properties
+                uint32_t props[28];
+                int np = rpmPropertyList(objectType, getObject(objectType, instance), props, 28);
+                for (int k = 0; k < np && respLen < RPM_LIMIT - 8; k++) {
+                    int w = emitRPMResult(&respBuf[respLen], RPM_LIMIT - respLen,
+                                          objectType, instance, props[k], -1);
+                    if (w == 0) break;
+                    respLen += w;
+                }
+            } else {
+                respLen += emitRPMResult(&respBuf[respLen], RPM_LIMIT - respLen,
+                                         objectType, instance, propId, refIndex);
+            }
         }
 
-        // Closing tag 1 (property references)
-        if (pos < apduLen && apdu[pos] == 0x1F) pos++;
-
-        respLen += encodeClosingTag(&respBuf[respLen], 1);
-        respLen += encodeClosingTag(&respBuf[respLen], 0);
+        if (pos < apduLen && apdu[pos] == 0x1F) pos++;     // request closing tag 1
+        respLen += encodeClosingTag(&respBuf[respLen], 1); // response listOfResults closing tag 1
     }
 
     sendIPResponse(respBuf, respLen, remoteIP, remotePort);
@@ -1268,9 +1397,8 @@ void BACnetLight::sendCOVNotification(COVSubscription *sub, BACnetObject *obj) {
 }
 
 void BACnetLight::expireCOVSubscriptions() {
-    static unsigned long lastCheck = 0;
-    if (millis() - lastCheck < 1000) return;
-    lastCheck = millis();
+    if (millis() - _lastCOVExpiry < 1000) return;
+    _lastCOVExpiry = millis();
 
     for (int i = 0; i < BACNET_MAX_COV_SUBSCRIPTIONS; i++) {
         if (_covSubs[i].active && _covSubs[i].lifetime > 0) {

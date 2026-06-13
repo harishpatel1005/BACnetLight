@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Arduino](https://img.shields.io/badge/Arduino-Compatible-teal.svg)](https://www.arduino.cc/)
 [![ESP32](https://img.shields.io/badge/ESP32-Supported-green.svg)](https://www.espressif.com/)
-[![Version](https://img.shields.io/badge/version-1.0.0-orange.svg)](https://github.com/harishpatel1005/BACnetLight)
+[![Version](https://img.shields.io/badge/version-1.0.2-orange.svg)](https://github.com/harishpatel1005/BACnetLight)
 
 BACnetLight turns an ESP32 into a fully functional BACnet device -- discoverable, readable, writable, and capable of pushing live updates via COV -- with minimal code. It supports both **BACnet/IP** (Ethernet/WiFi) and **BACnet/MSTP** (RS485), covering the vast majority of real-world building automation use cases.
 
@@ -313,6 +313,8 @@ Override these before `#include <BACnetLight.h>`:
 6. Right-click -> **Subscribe** to test COV
 7. Right-click writable objects -> **Write** to test WriteProperty
 
+For **BACnet/MSTP**, add an MS/TP serial port in YABE (Functions -> MSTP) matching your device's baud rate and `Max_Master`, then discover and read exactly as above. The device must share the RS485 bus and a common ground with the YABE adapter.
+
 ## Hardware Compatibility
 
 **Tested:** ESP32 + W5500 (SPI Ethernet), ESP32 + MAX485 (RS485)
@@ -364,7 +366,7 @@ BACnet/IP transmits plain-text UDP with no authentication or encryption. BACnet/
 - No trend logging
 - No BACnet Secure Connect (BACnet/SC)
 - No routing (routed NPDU messages with DNET/SNET are parsed but not forwarded)
-- MSTP: simplified token-passing (functional but not BTL-certified)
+- MSTP: simplified token-passing (passes to known masters; functional but not BTL-certified). Departed masters are not aged out of the known-master list.
 - Object/device names are truncated to 31 characters (`BACNET_MAX_NAME_LEN - 1`), descriptions to 63 characters (`BACNET_MAX_DESC_LEN - 1`)
 
 ## Roadmap
@@ -373,6 +375,21 @@ BACnet/IP transmits plain-text UDP with no authentication or encryption. BACnet/
 - [ ] Native ESP32 Ethernet (no W5500)
 - [ ] Alarm & event reporting
 - [ ] BACnet router (IP <-> MSTP bridging)
+
+## Changelog
+
+### 1.0.2
+- **BACnet/MSTP confirmed responses now work.** Replies to ReadProperty / WriteProperty / ReadPropertyMultiple are transmitted immediately while the requesting master is waiting (within the MS/TP reply timeout) instead of being deferred to the next token. Previously an MS/TP device was discoverable but never returned its object list. Verified end-to-end against YABE over RS485.
+- **Faster MS/TP token passing.** The token is now handed to the next *known* master on the bus instead of being walked sequentially through every (mostly empty) address, so the client gets the token back promptly and reads complete quickly.
+- **ReadPropertyMultiple rewritten.** Corrected the ACK encoding and added expansion of the `all` / `required` / `optional` special property identifiers used by common clients.
+- **ReadProperty array index support.** `object-list` can be read by index (`[0]` = count, `[i]` = member); priority arrays are readable by index.
+- Added the required Device properties `Protocol_Services_Supported` and `Protocol_Object_Types_Supported`.
+
+### 1.0.1
+- Fixed BACnet/MSTP I-Am never being transmitted; corrected token rotation, the COV expiry timer, and the NPDU version check.
+
+### 1.0.0
+- Initial public release.
 
 ## Contributing
 

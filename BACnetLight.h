@@ -31,10 +31,10 @@
 #ifndef BACNET_LIGHT_H
 #define BACNET_LIGHT_H
 
-#define BACNETLIGHT_VERSION "1.0.0"
+#define BACNETLIGHT_VERSION "1.0.2"
 #define BACNETLIGHT_VERSION_MAJOR 1
 #define BACNETLIGHT_VERSION_MINOR 0
-#define BACNETLIGHT_VERSION_PATCH 0
+#define BACNETLIGHT_VERSION_PATCH 2
 
 #include <Arduino.h>
 #include <Udp.h>
@@ -76,6 +76,8 @@
 #define BACNET_PROP_APP_SOFTWARE_VERSION  12
 #define BACNET_PROP_PROTOCOL_VERSION      98
 #define BACNET_PROP_PROTOCOL_REVISION     139
+#define BACNET_PROP_PROTOCOL_SERVICES_SUPPORTED      97
+#define BACNET_PROP_PROTOCOL_OBJECT_TYPES_SUPPORTED  96
 #define BACNET_PROP_OBJECT_LIST           76
 #define BACNET_PROP_MAX_APDU_LENGTH       62
 #define BACNET_PROP_SEGMENTATION_SUPPORTED 107
@@ -320,7 +322,7 @@ public:
                        const char *firmware = "1.0.0",
                        const char *software = "1.0.0");
 
-    void sendIAm();
+    virtual void sendIAm();
     uint8_t getObjectCount();
 
 protected:
@@ -360,6 +362,9 @@ protected:
     // Confirmed service invoke ID counter
     uint8_t _invokeId;
 
+    // Timestamp of last COV subscription expiry scan (member, not static, so each instance has its own)
+    unsigned long _lastCOVExpiry;
+
     // Set true by MSTP subclass while processing an MSTP request,
     // so sendIPResponse skips the UDP send and just fills _txBuf.
     bool _processingMSTP;
@@ -380,11 +385,20 @@ protected:
     int encodeAppNull(uint8_t *buf);
 
     // --- Property Encoding ---
-    int encodeDeviceProperty(uint8_t *buf, uint32_t property);
-    int encodeObjectProperty(uint8_t *buf, BACnetObject *obj, uint32_t property);
-    int encodePropertyValue(uint8_t *buf, uint16_t objectType, uint32_t instance, uint32_t property);
+    int encodeDeviceProperty(uint8_t *buf, uint32_t property, int32_t arrayIndex = -1);
+    int encodeObjectProperty(uint8_t *buf, BACnetObject *obj, uint32_t property, int32_t arrayIndex = -1);
+    int encodePropertyValue(uint8_t *buf, uint16_t objectType, uint32_t instance, uint32_t property, int32_t arrayIndex = -1);
     int encodePriorityArray(uint8_t *buf, BACnetObject *obj);
     int encodeCOVPropertyList(uint8_t *buf, BACnetObject *obj);
+
+    // --- ReadPropertyMultiple helpers ---
+    // Fill out[] with the property ids of an object/device for the "all"/
+    // "required"/"optional" special identifiers. Returns the count written.
+    int rpmPropertyList(uint16_t objectType, BACnetObject *obj, uint32_t *out, int maxOut);
+    // Encode one Read-Access-Result entry ([2]propId [3]index? [4]value|[5]error).
+    // Writes nothing and returns 0 if it would exceed maxLen.
+    int emitRPMResult(uint8_t *buf, int maxLen, uint16_t objectType, uint32_t instance,
+                      uint32_t property, int32_t arrayIndex);
 
     // --- Packet Handlers ---
     void handleIPPacket(int packetSize);
@@ -465,6 +479,8 @@ public:
      */
     void loop();
 
+    void sendIAm() override;
+
 private:
     // MSTP config
     HardwareSerial *_mstpSerial;
@@ -483,6 +499,12 @@ private:
     uint8_t _retryCount;
     uint8_t _framePending;
 
+    // Known masters on the bus (bitmap, 1 bit per MAC 0-127), learned from any
+    // frame we hear. The token is passed to the next known master in circular
+    // address order, instead of marching through every (mostly dead) address.
+    uint8_t _masterMap[16];
+    uint8_t _pollAddr;   // rolling address used to poll for new masters
+
     // MSTP frame buffers
     uint8_t _mstpRxBuf[BACNET_BUF_SIZE];
     uint8_t _mstpTxBuf[BACNET_BUF_SIZE];
@@ -492,6 +514,9 @@ private:
     bool _mstpTxPending;
     uint8_t _mstpTxDest;
     int _mstpTxDataLen;
+
+    // Periodic I-Am announcement
+    unsigned long _lastIAmMs;
 
     // MSTP CRC
     static uint8_t calcHeaderCRC(uint8_t *buf, int len);
@@ -505,6 +530,11 @@ private:
                          uint8_t *data, int dataLen);
     void mstpStateMachine();
     void mstpHandleDataFrame(uint8_t src, uint8_t *data, int dataLen, bool expectingReply);
+
+    // Known-master tracking for efficient token passing
+    void markMaster(uint8_t mac);
+    bool isMaster(uint8_t mac);
+    int  nextKnownMaster();   // next known master after our MAC, or -1 if none
 
     // RS485 direction control
     void setTxMode(bool tx);
