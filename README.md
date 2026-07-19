@@ -14,10 +14,10 @@ This repository is being prepared as the **first public release** of BACnetLight
 ## At a Glance
 
 - Lightweight BACnet library designed specifically for ESP32
+- Works as a BACnet **device/server** *and* as a BACnet/IP **client/master** (discover, read, write remote devices)
 - Supports BACnet/IP, BACnet/MSTP, and dual-port deployments
 - Includes object modeling, WriteProperty, ReadPropertyMultiple, COV, and priority arrays
-- Ships with example sketches for common device and gateway patterns
-- Example sketches have been compiled successfully for this first public release
+- Ships with example sketches for common device, gateway, and master patterns
 
 ## Contents
 
@@ -245,6 +245,50 @@ bacnet.onWrite([](BACnetObject *obj, float value, uint8_t priority) {
 });
 ```
 
+### Client / Master Role (BACnet/IP)
+
+In addition to being a BACnet device, BACnetLight can act as the **initiator** on a
+BACnet/IP network: broadcast Who-Is to discover devices, then read and write their
+object properties. The read/write helpers are **synchronous** — they send the request
+and pump the UDP socket until the reply arrives or the timeout elapses — so they are
+meant to be called from application code (e.g. a web handler), not from inside `loop()`.
+
+```cpp
+BACnetLight bacnet;
+EthernetUDP udp;
+
+bacnet.begin(999, "ESP-Master", IPAddress(192,168,1,255), udp);  // targetIP = subnet broadcast
+
+// 1) Discover devices
+bacnet.sendWhoIs();                 // optionally sendWhoIs(lowId, highId)
+unsigned long t = millis();
+while (millis() - t < 1000) bacnet.loop();   // collect I-Am replies for ~1 s
+
+for (uint8_t i = 0; i < bacnet.getDiscoveredCount(); i++) {
+    BACnetDevice d = bacnet.getDiscoveredDevice(i);
+    Serial.printf("Device %u at %d.%d.%d.%d\n", d.deviceId, d.ip[0], d.ip[1], d.ip[2], d.ip[3]);
+}
+
+// 2) Read a property (e.g. present-value of Analog Input 1)
+BACnetValue v;
+if (bacnet.readProperty(IPAddress(192,168,1,60), BACNET_OBJ_ANALOG_INPUT, 1,
+                        BACNET_PROP_PRESENT_VALUE, -1, v)) {
+    if (v.kind == BACNET_VAL_REAL)   Serial.println(v.realValue);
+    if (v.kind == BACNET_VAL_STRING) Serial.println(v.stringValue);
+}
+
+// 3) Write a property (e.g. command Analog Output 0 to 75.0 at priority 8)
+bacnet.writePropertyReal(IPAddress(192,168,1,60), BACNET_OBJ_ANALOG_OUTPUT, 0,
+                         BACNET_PROP_PRESENT_VALUE, 75.0f, 8);
+```
+
+`BACnetValue::kind` is one of `BACNET_VAL_REAL / _UNSIGNED / _SIGNED / _BOOLEAN /
+_ENUMERATED / _STRING / _OBJECT_ID / _DOUBLE`. On an Error reply, `ok` is `false` and
+`errorClass` / `errorCode` are filled. Set `BACNET_MAX_DISCOVERED_DEVICES` to `0` before
+including the header to compile the client out entirely (device-only builds pay nothing).
+
+> The client role is **BACnet/IP only**. MSTP remains device-side.
+
 ### Engineering Units
 
 ```cpp
@@ -377,6 +421,11 @@ BACnet/IP transmits plain-text UDP with no authentication or encryption. BACnet/
 - [ ] BACnet router (IP <-> MSTP bridging)
 
 ## Changelog
+
+### 2.0.0
+- **New: BACnet/IP client / master role.** BACnetLight can now *initiate* traffic, not just respond. Added `sendWhoIs()` with a discovered-device table (`getDiscoveredCount()` / `getDiscoveredDevice()`), and synchronous `readProperty()` / `writeProperty()` (plus `writePropertyReal/Enum/Bool`) helpers that transmit a confirmed request and pump the socket until the Complex-ACK / Simple-ACK / Error reply or a timeout. Incoming I-Am and Complex-ACK PDUs (previously dropped) are now routed to the client. A typed `BACnetValue` decoder returns REAL / UNSIGNED / SIGNED / BOOLEAN / ENUMERATED / STRING / OBJECT-ID / DOUBLE values.
+- **Gated by `BACNET_MAX_DISCOVERED_DEVICES`** (default 16; set to 0 to compile the client out — device-only builds are unaffected).
+- Fully backward compatible: no existing API changed. Major version bump reflects the significant new capability.
 
 ### 1.0.2
 - **BACnet/MSTP confirmed responses now work.** Replies to ReadProperty / WriteProperty / ReadPropertyMultiple are transmitted immediately while the requesting master is waiting (within the MS/TP reply timeout) instead of being deferred to the next token. Previously an MS/TP device was discoverable but never returned its object list. Verified end-to-end against YABE over RS485.

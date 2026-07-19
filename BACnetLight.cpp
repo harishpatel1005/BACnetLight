@@ -36,6 +36,14 @@ BACnetLight::BACnetLight() {
         _covSubs[i].active = false;
         _pendingCOV[i].active = false;
     }
+
+#if BACNET_MAX_DISCOVERED_DEVICES > 0
+    _discoveredCount = 0;
+    _clientPending = false;
+    _clientDone = false;
+    _clientInvokeId = 0;
+    _clientResult = nullptr;
+#endif
 }
 
 // ============================================================
@@ -745,6 +753,9 @@ void BACnetLight::handleAPDU(uint8_t *apdu, int apduLen, IPAddress remoteIP, uin
     switch (pduType) {
         case BACNET_PDU_UNCONFIRMED:
             if (apdu[1] == BACNET_SERVICE_WHO_IS) handleWhoIs(apdu, apduLen);
+#if BACNET_MAX_DISCOVERED_DEVICES > 0
+            else if (apdu[1] == BACNET_SERVICE_I_AM) handleIAm(apdu, apduLen, remoteIP, remotePort);
+#endif
             break;
         case BACNET_PDU_CONFIRMED:
             if (apduLen < 4) return;
@@ -763,11 +774,25 @@ void BACnetLight::handleAPDU(uint8_t *apdu, int apduLen, IPAddress remoteIP, uin
             // apdu[1]=invokeId, apdu[2]=service -- ACK for our confirmed COV notification
             if (apduLen >= 3 && apdu[2] == BACNET_SERVICE_CONFIRMED_COV_NOTIF)
                 handleCOVSimpleAck(apdu[1]);
+#if BACNET_MAX_DISCOVERED_DEVICES > 0
+            else
+                handleClientSimpleAck(apdu, apduLen);   // e.g. WriteProperty ack
+#endif
             break;
+#if BACNET_MAX_DISCOVERED_DEVICES > 0
+        case BACNET_PDU_COMPLEX_ACK:
+            // Reply to one of our client requests (e.g. ReadProperty)
+            handleComplexAck(apdu, apduLen);
+            break;
+#endif
         case BACNET_PDU_ERROR:
             // apdu[1]=invokeId, apdu[2]=service -- remote rejected our confirmed COV notification
             if (apduLen >= 3 && apdu[2] == BACNET_SERVICE_CONFIRMED_COV_NOTIF)
                 handleCOVError(apdu[1]);
+#if BACNET_MAX_DISCOVERED_DEVICES > 0
+            else
+                handleClientError(apdu, apduLen);
+#endif
             break;
     }
 }
@@ -1461,3 +1486,431 @@ void BACnetLight::retryPendingCOV() {
                              &_covSubs[si], &_objects[oi]);
     }
 }
+
+#if BACNET_MAX_DISCOVERED_DEVICES > 0
+// ============================================================
+// Client / Master role
+// ============================================================
+
+// --- Discovered-device table ---
+
+void BACnetLight::addDiscoveredDevice(uint32_t deviceId, IPAddress ip,
+                                      uint16_t port, uint16_t vendorId) {
+    // Update in place if we already know this device instance.
+    for (uint8_t i = 0; i < _discoveredCount; i++) {
+        if (_discovered[i].deviceId == deviceId) {
+            _discovered[i].ip = ip;
+            _discovered[i].port = port;
+            _discovered[i].vendorId = vendorId;
+            return;
+        }
+    }
+    if (_discoveredCount >= BACNET_MAX_DISCOVERED_DEVICES) return;  // table full
+    _discovered[_discoveredCount].deviceId = deviceId;
+    _discovered[_discoveredCount].ip = ip;
+    _discovered[_discoveredCount].port = port;
+    _discovered[_discoveredCount].vendorId = vendorId;
+    _discoveredCount++;
+}
+
+uint8_t BACnetLight::getDiscoveredCount() { return _discoveredCount; }
+
+BACnetDevice BACnetLight::getDiscoveredDevice(uint8_t index) {
+    if (index < _discoveredCount) return _discovered[index];
+    BACnetDevice empty;
+    memset(&empty, 0, sizeof(empty));
+    return empty;
+}
+
+void BACnetLight::clearDiscovered() { _discoveredCount = 0; }
+
+// --- Who-Is (broadcast) ---
+
+void BACnetLight::sendWhoIs(int32_t lowLimit, int32_t highLimit) {
+    if (!_ipEnabled || _udp == nullptr) return;
+
+    uint8_t buf[BACNET_BUF_SIZE];
+    int n = 0;
+
+    // BVLC: Original-Broadcast-NPDU
+    buf[n++] = 0x81;
+    buf[n++] = 0x0B;
+    buf[n++] = 0x00;   // length placeholder
+    buf[n++] = 0x00;
+
+    // NPDU: version 1, global broadcast destination (DNET 0xFFFF)
+    buf[n++] = 0x01;
+    buf[n++] = 0x20;
+    buf[n++] = 0xFF;
+    buf[n++] = 0xFF;
+    buf[n++] = 0x00;   // DLEN 0 = broadcast
+    buf[n++] = 0xFF;   // hop count
+
+    // APDU: Unconfirmed-Request, Who-Is
+    buf[n++] = BACNET_PDU_UNCONFIRMED;
+    buf[n++] = BACNET_SERVICE_WHO_IS;
+
+    // Optional device-instance range (context tags 0 and 1)
+    if (lowLimit >= 0 && highLimit >= 0) {
+        n += encodeContextUnsigned(&buf[n], 0, (uint32_t)lowLimit);
+        n += encodeContextUnsigned(&buf[n], 1, (uint32_t)highLimit);
+    }
+
+    buf[2] = (n >> 8) & 0xFF;
+    buf[3] = n & 0xFF;
+
+    _udp->beginPacket(_targetIP, BACNET_IP_PORT);
+    _udp->write(buf, n);
+    _udp->endPacket();
+}
+
+// --- I-Am handler (populate discovered-device table) ---
+
+void BACnetLight::handleIAm(uint8_t *apdu, int apduLen,
+                            IPAddress remoteIP, uint16_t remotePort) {
+    // apdu: [0]=0x10 [1]=0x00(I-Am) [2]=0xC4 objId(4) then maxAPDU, seg, vendorId
+    int pos = 2;
+    if (pos >= apduLen || apdu[pos] != 0xC4) return;   // expect app object-id tag
+    pos++;
+    if (pos + 4 > apduLen) return;
+    uint32_t oid = ((uint32_t)apdu[pos] << 24) | ((uint32_t)apdu[pos + 1] << 16) |
+                   ((uint32_t)apdu[pos + 2] << 8) | apdu[pos + 3];
+    pos += 4;
+    uint16_t objType = (oid >> 22) & 0x3FF;
+    uint32_t deviceId = oid & 0x3FFFFF;
+    if (objType != BACNET_OBJ_DEVICE) return;
+
+    // Walk remaining app-tagged fields to pull out the vendor id (last unsigned).
+    uint16_t vendorId = 0;
+    while (pos < apduLen) {
+        uint8_t tag = apdu[pos++];
+        uint8_t tagNum = (tag >> 4) & 0x0F;
+        int dlen = tag & 0x07;
+        if (dlen == 5 && pos < apduLen) dlen = apdu[pos++];
+        if (tagNum == BACNET_TAG_UNSIGNED) {
+            uint32_t v = 0;
+            for (int i = 0; i < dlen && pos < apduLen; i++) v = (v << 8) | apdu[pos++];
+            vendorId = (uint16_t)v;   // the trailing unsigned is the vendor id
+        } else {
+            pos += dlen;
+        }
+    }
+
+    addDiscoveredDevice(deviceId, remoteIP, remotePort, vendorId);
+}
+
+// --- Send a confirmed request (unicast, expecting reply) ---
+
+void BACnetLight::sendConfirmedTo(IPAddress ip, uint8_t *apdu, int apduLen) {
+    if (!_ipEnabled || _udp == nullptr) return;
+    if (apduLen < 0 || apduLen + 6 > BACNET_BUF_SIZE) return;
+
+    uint8_t buf[BACNET_BUF_SIZE];
+    int n = 0;
+    buf[n++] = 0x81;   // BVLC
+    buf[n++] = 0x0A;   // Original-Unicast-NPDU
+    buf[n++] = 0x00;
+    buf[n++] = 0x00;
+    buf[n++] = 0x01;   // NPDU version
+    buf[n++] = 0x04;   // control: expecting-reply
+    memcpy(&buf[n], apdu, apduLen);
+    n += apduLen;
+    buf[2] = (n >> 8) & 0xFF;
+    buf[3] = n & 0xFF;
+
+    _udp->beginPacket(ip, BACNET_IP_PORT);
+    _udp->write(buf, n);
+    _udp->endPacket();
+}
+
+// --- Synchronous wait: pump UDP until our reply arrives or timeout ---
+
+bool BACnetLight::waitForClientReply(uint16_t timeoutMs) {
+    unsigned long start = millis();
+    while ((millis() - start) < timeoutMs) {
+        if (_udp != nullptr) {
+            int ps = _udp->parsePacket();
+            if (ps > 0) handleIPPacket(ps);
+        }
+        if (_clientDone) return true;
+        yield();   // feed the watchdog on ESP32/ESP8266
+    }
+    return _clientDone;
+}
+
+// --- ReadProperty ---
+
+bool BACnetLight::readProperty(IPAddress ip, uint16_t objType, uint32_t instance,
+                               uint32_t propId, int32_t arrayIndex,
+                               BACnetValue &out, uint16_t timeoutMs) {
+    memset(&out, 0, sizeof(out));
+    if (!_ipEnabled || _udp == nullptr) return false;
+
+    uint8_t apdu[32];
+    int n = 0;
+    uint8_t id = _invokeId++;
+
+    apdu[n++] = BACNET_PDU_CONFIRMED;               // 0x00
+    apdu[n++] = 0x05;                               // max segments/response APDU
+    apdu[n++] = id;
+    apdu[n++] = BACNET_SERVICE_READ_PROPERTY;       // 0x0C
+
+    uint32_t oid = ((uint32_t)objType << 22) | (instance & 0x3FFFFF);
+    n += encodeContextTag(&apdu[n], 0, oid, 4);     // object identifier
+    if (propId < 0x100) n += encodeContextTag(&apdu[n], 1, propId, 1);
+    else                n += encodeContextTag(&apdu[n], 1, propId, 2);
+    if (arrayIndex >= 0) n += encodeContextUnsigned(&apdu[n], 2, (uint32_t)arrayIndex);
+
+    _clientResult   = &out;
+    _clientInvokeId = id;
+    _clientPending  = true;
+    _clientDone     = false;
+
+    sendConfirmedTo(ip, apdu, n);
+    waitForClientReply(timeoutMs);
+
+    _clientPending = false;
+    _clientResult  = nullptr;
+    return _clientDone && out.ok;
+}
+
+// --- WriteProperty ---
+
+bool BACnetLight::writeProperty(IPAddress ip, uint16_t objType, uint32_t instance,
+                                uint32_t propId, const BACnetValue &val,
+                                uint8_t priority, uint16_t timeoutMs) {
+    BACnetValue result;
+    memset(&result, 0, sizeof(result));
+    if (!_ipEnabled || _udp == nullptr) return false;
+
+    uint8_t apdu[64];
+    int n = 0;
+    uint8_t id = _invokeId++;
+
+    apdu[n++] = BACNET_PDU_CONFIRMED;               // 0x00
+    apdu[n++] = 0x05;
+    apdu[n++] = id;
+    apdu[n++] = BACNET_SERVICE_WRITE_PROPERTY;      // 0x0F
+
+    uint32_t oid = ((uint32_t)objType << 22) | (instance & 0x3FFFFF);
+    n += encodeContextTag(&apdu[n], 0, oid, 4);     // object identifier
+    if (propId < 0x100) n += encodeContextTag(&apdu[n], 1, propId, 1);
+    else                n += encodeContextTag(&apdu[n], 1, propId, 2);
+
+    // propertyValue [3] (opening tag, application value, closing tag)
+    n += encodeOpeningTag(&apdu[n], 3);
+    switch (val.kind) {
+        case BACNET_VAL_REAL:       n += encodeAppReal(&apdu[n], val.realValue); break;
+        case BACNET_VAL_UNSIGNED:   n += encodeAppUnsigned(&apdu[n], val.unsignedValue); break;
+        case BACNET_VAL_SIGNED:     n += encodeAppSigned(&apdu[n], val.signedValue); break;
+        case BACNET_VAL_ENUMERATED: n += encodeAppEnumerated(&apdu[n], val.unsignedValue); break;
+        case BACNET_VAL_BOOLEAN:    n += encodeAppBoolean(&apdu[n], val.boolValue); break;
+        case BACNET_VAL_STRING:     n += encodeAppCharString(&apdu[n], val.stringValue); break;
+        default:                    n += encodeAppReal(&apdu[n], val.realValue); break;
+    }
+    n += encodeClosingTag(&apdu[n], 3);
+
+    // priority [4] (optional, 1..16)
+    if (priority >= 1 && priority <= 16)
+        n += encodeContextUnsigned(&apdu[n], 4, priority);
+
+    _clientResult   = &result;
+    _clientInvokeId = id;
+    _clientPending  = true;
+    _clientDone     = false;
+
+    sendConfirmedTo(ip, apdu, n);
+    waitForClientReply(timeoutMs);
+
+    _clientPending = false;
+    _clientResult  = nullptr;
+    return _clientDone && result.ok;
+}
+
+bool BACnetLight::writePropertyReal(IPAddress ip, uint16_t objType, uint32_t instance,
+                                    uint32_t propId, float value, uint8_t priority,
+                                    uint16_t timeoutMs) {
+    BACnetValue v; memset(&v, 0, sizeof(v));
+    v.kind = BACNET_VAL_REAL; v.realValue = value;
+    return writeProperty(ip, objType, instance, propId, v, priority, timeoutMs);
+}
+
+bool BACnetLight::writePropertyEnum(IPAddress ip, uint16_t objType, uint32_t instance,
+                                    uint32_t propId, uint32_t value, uint8_t priority,
+                                    uint16_t timeoutMs) {
+    BACnetValue v; memset(&v, 0, sizeof(v));
+    v.kind = BACNET_VAL_ENUMERATED; v.unsignedValue = value;
+    return writeProperty(ip, objType, instance, propId, v, priority, timeoutMs);
+}
+
+bool BACnetLight::writePropertyBool(IPAddress ip, uint16_t objType, uint32_t instance,
+                                    uint32_t propId, bool value, uint8_t priority,
+                                    uint16_t timeoutMs) {
+    BACnetValue v; memset(&v, 0, sizeof(v));
+    v.kind = BACNET_VAL_BOOLEAN; v.boolValue = value;
+    return writeProperty(ip, objType, instance, propId, v, priority, timeoutMs);
+}
+
+// --- Reply handlers (matched on invoke id) ---
+
+void BACnetLight::handleComplexAck(uint8_t *apdu, int apduLen) {
+    if (!_clientPending || apduLen < 3) return;
+    if (apdu[1] != _clientInvokeId) return;
+    if (apdu[2] == BACNET_SERVICE_READ_PROPERTY && _clientResult != nullptr)
+        decodeReadPropertyAck(apdu, apduLen, *_clientResult);
+    _clientDone = true;
+}
+
+void BACnetLight::handleClientSimpleAck(uint8_t *apdu, int apduLen) {
+    if (!_clientPending || apduLen < 2) return;
+    if (apdu[1] != _clientInvokeId) return;
+    if (_clientResult != nullptr) _clientResult->ok = true;   // write accepted
+    _clientDone = true;
+}
+
+void BACnetLight::handleClientError(uint8_t *apdu, int apduLen) {
+    if (!_clientPending || apduLen < 2) return;
+    if (apdu[1] != _clientInvokeId) return;
+    if (_clientResult != nullptr) {
+        _clientResult->ok = false;
+        int pos = 3;   // after [0]error-pdu [1]invoke [2]service
+        // error-class (enumerated)
+        if (pos < apduLen) {
+            uint8_t t = apdu[pos++]; int l = t & 0x07; uint32_t v = 0;
+            for (int i = 0; i < l && pos < apduLen; i++) v = (v << 8) | apdu[pos++];
+            _clientResult->errorClass = (uint8_t)v;
+        }
+        // error-code (enumerated)
+        if (pos < apduLen) {
+            uint8_t t = apdu[pos++]; int l = t & 0x07; uint32_t v = 0;
+            for (int i = 0; i < l && pos < apduLen; i++) v = (v << 8) | apdu[pos++];
+            _clientResult->errorCode = (uint8_t)v;
+        }
+    }
+    _clientDone = true;
+}
+
+// --- Decode a ReadProperty Complex-ACK into a typed value ---
+
+bool BACnetLight::decodeReadPropertyAck(uint8_t *apdu, int apduLen, BACnetValue &out) {
+    // Layout: [0]0x30 [1]invoke [2]0x0C
+    //         [0] objectIdentifier  (context tag 0, len 4)
+    //         [1] propertyIdentifier (context tag 1)
+    //         [2] propertyArrayIndex (context tag 2, optional)
+    //         [3] opening tag (0x3E) <app value> closing tag (0x3F)
+    int pos = 3;
+    // Skip object identifier [0]
+    if (pos < apduLen && apdu[pos] == 0x0C) pos += 5;
+    // Skip property identifier [1]
+    if (pos < apduLen && (apdu[pos] & 0xF8) == 0x18) {
+        int l = apdu[pos] & 0x07; pos += 1 + l;
+    }
+    // Skip optional array index [2]
+    if (pos < apduLen && (apdu[pos] & 0xF8) == 0x28) {
+        int l = apdu[pos] & 0x07; pos += 1 + l;
+    }
+    // Expect opening tag [3]; fall back to scanning if the structure differed.
+    if (pos < apduLen && apdu[pos] == 0x3E) {
+        pos++;
+    } else {
+        int scan = 3;
+        while (scan < apduLen && apdu[scan] != 0x3E) scan++;
+        if (scan >= apduLen) return false;
+        pos = scan + 1;
+    }
+    decodeTaggedValue(apdu, pos, apduLen, out);
+    return out.ok;
+}
+
+// --- Decode one application-tagged value into a BACnetValue ---
+
+int BACnetLight::decodeTaggedValue(uint8_t *buf, int pos, int len, BACnetValue &out) {
+    out.kind = BACNET_VAL_NONE;
+    out.ok = false;
+    if (pos >= len) return pos;
+
+    uint8_t tag = buf[pos++];
+    uint8_t tagNum = (tag >> 4) & 0x0F;
+    int dlen = tag & 0x07;
+
+    // Boolean carries its value in the length nibble -- handle before len expansion.
+    if (tagNum == BACNET_TAG_BOOLEAN) {
+        out.boolValue = (dlen & 0x01);
+        out.realValue = out.boolValue ? 1.0f : 0.0f;
+        out.kind = BACNET_VAL_BOOLEAN;
+        out.ok = true;
+        return pos;
+    }
+    if (dlen == 5 && pos < len) dlen = buf[pos++];
+
+    switch (tagNum) {
+        case BACNET_TAG_REAL:
+            if (pos + 4 <= len) {
+                uint8_t fb[4];
+                fb[3] = buf[pos]; fb[2] = buf[pos + 1]; fb[1] = buf[pos + 2]; fb[0] = buf[pos + 3];
+                memcpy(&out.realValue, fb, 4);
+                pos += 4;
+                out.kind = BACNET_VAL_REAL;
+            }
+            break;
+        case BACNET_TAG_DOUBLE:
+            if (pos + 8 <= len) {
+                uint8_t db[8];
+                for (int i = 0; i < 8; i++) db[7 - i] = buf[pos + i];
+                double d; memcpy(&d, db, 8);
+                out.realValue = (float)d;
+                pos += 8;
+                out.kind = BACNET_VAL_DOUBLE;
+            }
+            break;
+        case BACNET_TAG_UNSIGNED: {
+            uint32_t v = 0;
+            for (int i = 0; i < dlen && pos < len; i++) v = (v << 8) | buf[pos++];
+            out.unsignedValue = v; out.realValue = (float)v;
+            out.kind = BACNET_VAL_UNSIGNED;
+            break;
+        }
+        case BACNET_TAG_SIGNED: {
+            int32_t v = (dlen > 0 && (buf[pos] & 0x80)) ? -1 : 0;
+            for (int i = 0; i < dlen && pos < len; i++) v = (v << 8) | buf[pos++];
+            out.signedValue = v; out.realValue = (float)v;
+            out.kind = BACNET_VAL_SIGNED;
+            break;
+        }
+        case BACNET_TAG_ENUMERATED: {
+            uint32_t v = 0;
+            for (int i = 0; i < dlen && pos < len; i++) v = (v << 8) | buf[pos++];
+            out.unsignedValue = v; out.realValue = (float)v;
+            out.kind = BACNET_VAL_ENUMERATED;
+            break;
+        }
+        case BACNET_TAG_CHAR_STRING: {
+            if (dlen > 0) { pos++; dlen--; }   // skip character-set byte
+            int cl = dlen;
+            if (cl > (int)sizeof(out.stringValue) - 1) cl = sizeof(out.stringValue) - 1;
+            if (pos + cl <= len) memcpy(out.stringValue, &buf[pos], cl);
+            else cl = 0;
+            out.stringValue[cl] = '\0';
+            pos += dlen;
+            out.kind = BACNET_VAL_STRING;
+            break;
+        }
+        case BACNET_TAG_OBJECT_ID:
+            if (pos + 4 <= len) {
+                uint32_t v = ((uint32_t)buf[pos] << 24) | ((uint32_t)buf[pos + 1] << 16) |
+                             ((uint32_t)buf[pos + 2] << 8) | buf[pos + 3];
+                pos += 4;
+                out.objType = (v >> 22) & 0x3FF;
+                out.objInstance = v & 0x3FFFFF;
+                out.realValue = (float)out.objInstance;
+                out.kind = BACNET_VAL_OBJECT_ID;
+            }
+            break;
+        default:
+            break;
+    }
+
+    out.ok = (out.kind != BACNET_VAL_NONE);
+    return pos;
+}
+#endif // BACNET_MAX_DISCOVERED_DEVICES > 0

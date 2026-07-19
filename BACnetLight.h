@@ -31,10 +31,10 @@
 #ifndef BACNET_LIGHT_H
 #define BACNET_LIGHT_H
 
-#define BACNETLIGHT_VERSION "1.0.2"
-#define BACNETLIGHT_VERSION_MAJOR 1
+#define BACNETLIGHT_VERSION "2.0.0"
+#define BACNETLIGHT_VERSION_MAJOR 2
 #define BACNETLIGHT_VERSION_MINOR 0
-#define BACNETLIGHT_VERSION_PATCH 2
+#define BACNETLIGHT_VERSION_PATCH 0
 
 #include <Arduino.h>
 #include <Udp.h>
@@ -168,6 +168,14 @@
 #define BACNET_COV_MAX_RETRIES 2      // cancel subscription after this many timeouts
 #endif
 
+// Client / Master role: max devices remembered from I-Am replies.
+// Set to 0 to compile the client (Who-Is / ReadProperty / WriteProperty
+// initiator) out entirely -- a device-only build then pays zero extra
+// flash/RAM for it.
+#ifndef BACNET_MAX_DISCOVERED_DEVICES
+#define BACNET_MAX_DISCOVERED_DEVICES 16
+#endif
+
 // BACnet priority levels (16 levels, 1=highest)
 #define BACNET_NUM_PRIORITIES 16
 #define BACNET_NO_PRIORITY    0xFF
@@ -223,6 +231,46 @@ struct PendingConfirmedRequest {
     uint8_t       objIndex;     // index into _objects[]
     unsigned long sentTime;     // millis() at last transmission
     uint8_t       retryCount;
+};
+
+// ============================================================
+// Client Role: decoded value + discovered device
+// ============================================================
+
+// Value kind returned by a ReadProperty ACK (see BACnetValue::kind).
+#define BACNET_VAL_NONE       0
+#define BACNET_VAL_REAL       1
+#define BACNET_VAL_UNSIGNED   2
+#define BACNET_VAL_SIGNED     3
+#define BACNET_VAL_BOOLEAN    4
+#define BACNET_VAL_ENUMERATED 5
+#define BACNET_VAL_STRING     6
+#define BACNET_VAL_OBJECT_ID  7
+#define BACNET_VAL_DOUBLE     8
+
+// Result of a client ReadProperty (or the payload for a WriteProperty).
+// `ok` is true when a value was decoded (read) or the write was accepted.
+// On an Error-PDU reply, `ok` is false and errorClass/errorCode are filled.
+struct BACnetValue {
+    uint8_t  kind;                          // BACNET_VAL_*
+    bool     ok;
+    float    realValue;                     // numeric convenience for all number kinds
+    uint32_t unsignedValue;                 // raw for UNSIGNED / ENUMERATED
+    int32_t  signedValue;                   // raw for SIGNED
+    bool     boolValue;                     // for BOOLEAN
+    char     stringValue[BACNET_MAX_NAME_LEN]; // for STRING
+    uint16_t objType;                       // for OBJECT_ID
+    uint32_t objInstance;                   // for OBJECT_ID
+    uint8_t  errorClass;                    // BACnet error-class (Error-PDU)
+    uint8_t  errorCode;                     // BACnet error-code  (Error-PDU)
+};
+
+// One entry in the discovered-device table, learned from I-Am replies.
+struct BACnetDevice {
+    uint32_t  deviceId;
+    IPAddress ip;
+    uint16_t  port;
+    uint16_t  vendorId;
 };
 
 // ============================================================
@@ -324,6 +372,54 @@ public:
 
     virtual void sendIAm();
     uint8_t getObjectCount();
+
+#if BACNET_MAX_DISCOVERED_DEVICES > 0
+    // ========================================================
+    // Client / Master role (BACnet/IP only)
+    //
+    // The ESP acts as the *initiator*: it broadcasts Who-Is to
+    // discover devices, then reads/writes their object properties.
+    // The read/write helpers are synchronous -- they transmit the
+    // request and pump the UDP socket until the matching reply
+    // arrives or `timeoutMs` elapses. Call them from application
+    // code (e.g. a web handler), not from inside loop().
+    // ========================================================
+
+    // Broadcast Who-Is to _targetIP (set to your subnet broadcast in begin()).
+    // Pass a device-instance range, or leave defaults for an unrestricted Who-Is.
+    // Replies (I-Am) populate the discovered-device table; read it back with
+    // getDiscoveredCount()/getDiscoveredDevice() after a short delay or after
+    // pumping loop() for ~500 ms.
+    void sendWhoIs(int32_t lowLimit = -1, int32_t highLimit = -1);
+
+    uint8_t      getDiscoveredCount();
+    BACnetDevice getDiscoveredDevice(uint8_t index);
+    void         clearDiscovered();
+
+    // Read one property. Returns true and fills `out` on a Complex-ACK;
+    // returns false on timeout or Error-PDU (out.errorClass/errorCode set).
+    bool readProperty(IPAddress ip, uint16_t objType, uint32_t instance,
+                      uint32_t propId, int32_t arrayIndex,
+                      BACnetValue &out, uint16_t timeoutMs = 1000);
+
+    // Write one property. `val.kind` selects the encoding of the written
+    // value. `priority` 1..16 adds a priority (0 = none). Returns true on
+    // Simple-ACK, false on timeout/Error.
+    bool writeProperty(IPAddress ip, uint16_t objType, uint32_t instance,
+                       uint32_t propId, const BACnetValue &val,
+                       uint8_t priority = 0, uint16_t timeoutMs = 1000);
+
+    // Convenience wrappers for the common written types.
+    bool writePropertyReal(IPAddress ip, uint16_t objType, uint32_t instance,
+                           uint32_t propId, float value, uint8_t priority = 0,
+                           uint16_t timeoutMs = 1000);
+    bool writePropertyEnum(IPAddress ip, uint16_t objType, uint32_t instance,
+                           uint32_t propId, uint32_t value, uint8_t priority = 0,
+                           uint16_t timeoutMs = 1000);
+    bool writePropertyBool(IPAddress ip, uint16_t objType, uint32_t instance,
+                           uint32_t propId, bool value, uint8_t priority = 0,
+                           uint16_t timeoutMs = 1000);
+#endif // BACNET_MAX_DISCOVERED_DEVICES > 0
 
 protected:
     // Device properties
@@ -435,6 +531,29 @@ protected:
     // --- IP Response Helper ---
     // Virtual so BACnetMSTP can override to route responses over MSTP instead of UDP.
     virtual void sendIPResponse(uint8_t *apdu, int apduLen, IPAddress remoteIP, uint16_t remotePort);
+
+#if BACNET_MAX_DISCOVERED_DEVICES > 0
+    // --- Client state ---
+    BACnetDevice _discovered[BACNET_MAX_DISCOVERED_DEVICES];
+    uint8_t      _discoveredCount;
+
+    // In-flight client request (one at a time; requests are synchronous)
+    bool         _clientPending;
+    uint8_t      _clientInvokeId;
+    bool         _clientDone;
+    BACnetValue *_clientResult;
+
+    // --- Client helpers ---
+    void sendConfirmedTo(IPAddress ip, uint8_t *apdu, int apduLen);
+    bool waitForClientReply(uint16_t timeoutMs);
+    void handleIAm(uint8_t *apdu, int apduLen, IPAddress remoteIP, uint16_t remotePort);
+    void handleComplexAck(uint8_t *apdu, int apduLen);
+    void handleClientSimpleAck(uint8_t *apdu, int apduLen);
+    void handleClientError(uint8_t *apdu, int apduLen);
+    bool decodeReadPropertyAck(uint8_t *apdu, int apduLen, BACnetValue &out);
+    int  decodeTaggedValue(uint8_t *buf, int pos, int len, BACnetValue &out);
+    void addDiscoveredDevice(uint32_t deviceId, IPAddress ip, uint16_t port, uint16_t vendorId);
+#endif
 };
 
 // ============================================================
